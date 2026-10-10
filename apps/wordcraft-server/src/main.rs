@@ -21,7 +21,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&data_dir)?;
     let database = data_dir.join("wordcraft.sqlite3");
     let store = Arc::new(Store::open(&database).map_err(std::io::Error::other)?);
-    let app = api_router(store).fallback_service(ServeDir::new(web_dir.clone()).append_index_html_on_directories(true));
+    let app = api_router(store)?.fallback_service(ServeDir::new(web_dir.clone()).append_index_html_on_directories(true));
     let listener = tokio::net::TcpListener::bind(address).await?;
 
     eprintln!("WordCraft server listening on http://{address}");

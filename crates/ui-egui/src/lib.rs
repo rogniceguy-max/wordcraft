@@ -50,6 +50,11 @@ pub struct Services {
     pub download: Option<Box<dyn Fn(&str, &[u8]) -> Result<(), String>>>,
     /// Web: request a durable shared-server save. `Some(name)` creates a new server document.
     pub server_save: Option<Box<dyn Fn(Option<&str>, &wordcraft_doc::Document, u64)>>,
+    /// Optional command adapter for a host-managed live collaboration session. Returning `None`
+    /// leaves the command to the regular engine path; `Some` handles or rejects it.
+    pub collaboration_command: Option<Box<dyn FnMut(&mut Session, &str, &Value) -> Option<Result<Value, String>>>>,
+    /// Optional collaborative undo/redo state for the Quick Access Toolbar.
+    pub collaboration_history: Option<Box<dyn Fn() -> Option<(bool, bool)>>>,
 }
 
 /// Files delivered asynchronously.
@@ -180,6 +185,14 @@ impl WordApp {
         if let Some(r) = self.ui_command(id, &params) {
             return r;
         }
+        let collaboration_result = self.services.collaboration_command.as_mut().and_then(|handler| handler(&mut self.session, id, &params));
+        if let Some(result) = collaboration_result {
+            self.after_command(id);
+            if let Err(error) = &result {
+                self.status(error.clone());
+            }
+            return result;
+        }
         if id == "file.saveAs" && params.get("path").and_then(Value::as_str).is_none() && self.services.server_save.is_some() {
             self.save_as_dialog();
             return Ok(json!({"saved": false, "target": "server"}));
@@ -229,6 +242,14 @@ impl WordApp {
             self.status(e.clone());
         }
         r
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.services.collaboration_history.as_ref().and_then(|history| history()).map(|(undo, _)| undo).unwrap_or_else(|| self.session.can_undo())
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.services.collaboration_history.as_ref().and_then(|history| history()).map(|(_, redo)| redo).unwrap_or_else(|| self.session.can_redo())
     }
 
     /// Export a copy through the host's download service without changing save state.

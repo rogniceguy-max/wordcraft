@@ -21,6 +21,7 @@ log = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 wordcraft-doc = { workspace = true }
+yrs = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # `wgpu` pulls egui-wgpu's defaults: WebGPU plus the WebGL2 fallback.
@@ -29,4 +30,4 @@ rfd = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "HtmlCanvasElement", "HtmlAnchorElement", "Blob", "BlobPropertyBag", "Url", "Location", "CssStyleDeclaration", "Request", "RequestInit", "Response", "Headers", "Storage", "Performance", "BeforeUnloadEvent", "Event", "EventTarget"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "HtmlCanvasElement", "HtmlAnchorElement", "Blob", "BlobPropertyBag", "Url", "Location", "CssStyleDeclaration", "Request", "RequestInit", "Response", "Headers", "Storage", "Performance", "PerformanceNavigationTiming", "NavigationType", "BeforeUnloadEvent", "Event", "EventTarget", "WebSocket", "MessageEvent", "BinaryType"] }

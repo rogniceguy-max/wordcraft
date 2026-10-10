@@ -119,13 +119,13 @@ from desktop feature parity:
 | P0 architecture audit | **done**; `docs/collaboration-model.md` records the positional-path and snapshot-undo hazards |
 | P1 browser build and DOCX round-trip | Trunk release build and local WebGPU/WebGL2 browser startup/input/server-save smoke passed; DOCX browser round-trip and Chrome/Edge/Safari/IME matrix remain unverified |
 | P2 server persistence, CAS versions and restore | implemented; workspace CI and local HTTP/browser save smoke passed, including stale-version conflict and restore; Mac restart recovery remains unverified |
-| P3 live collaborative text | **prototype only**; Yrs concurrent Unicode/undo tests pass but are not wired into the editor |
-| P4 rich-text/table collaboration and presence | not started; no WebSocket sync, shared cursor, or multi-client acceptance path yet |
+| P3 live collaborative text | **narrow prototype wired**; durable Yrs WebSocket updates, one plain-text paragraph, Unicode position mapping, delete/undo isolation, exact replay ACK, restart replay, snapshot-lock persistence, per-tab recovery keys, and single-server DB lock have automated coverage; local three-tab browser smoke passed in both edit directions and actor undo |
+| P4 rich-text/table collaboration and presence | not started; formatting, multiple paragraphs, table cells, shared cursors/presence, heartbeats, automatic reconnect, and automatic reload rejoin are not supported |
 | P5 per-browser pure-black page display | implemented and covered by renderer/UI tests; in-browser black-theme visual review remains pending |
 | P6 dated backup and restore tooling | implemented; workspace CI and local backup verify/restore smoke passed against an isolated test database; launchd scheduling remains unverified on macOS |
 | P7 Mac mini deployment and browser acceptance | not run; no target Mac is connected, and scenarios A–I have not passed end to end |
 
-These results validate the web shell, persistence API, prototype, theme, and backup components. They do not meet the final two-client real-time collaboration success criterion until P4 and the Mac/browser acceptance work are completed.
+These results validate the web shell, persistence API, a text-only collaboration slice, theme, and backup components. The local browser smoke used three tabs on one Windows host; it does not validate two separate computers, IME composition, Chrome/Edge/Safari, Mac reboot, or the performance matrix. The collaboration slice deliberately blocks unsupported edits and snapshot restore. It does not meet the final success criterion until P4 and the remaining Mac/browser acceptance work are completed.
 
 The DOCX fidelity corpus, then footnote continuation, column balancing and native printing remain
 the next desktop parity priorities.

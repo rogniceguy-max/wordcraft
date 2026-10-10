@@ -17,6 +17,9 @@ mod web;
 mod server;
 
 #[cfg(any(target_arch = "wasm32", test))]
+mod collaboration;
+
+#[cfg(any(target_arch = "wasm32", test))]
 mod server_policy;
 
 #[cfg(target_arch = "wasm32")]

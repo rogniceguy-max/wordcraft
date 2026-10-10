@@ -1,8 +1,11 @@
 # WordCraft server on a headless Mac
 
-The server stores the current document, embedded media, source-format parts, and immutable
-document versions in one SQLite database. It serves the Trunk-built web editor and the `/api`
-document API from the same origin.
+The server stores the current document, embedded media, source-format parts, immutable document
+versions, and the live-text seed/update log in one SQLite database. It serves the Trunk-built web
+editor and the `/api` document API from the same origin. Run exactly one WordCraft server for each
+database: the API router holds an OS advisory lock beside the canonical database path and exits with
+an error if another WordCraft process already holds it. Keep the database and its lock file on a
+local filesystem with working advisory-lock semantics; hard-linked aliases are outside this guard.
 
 ## Build and install
 
@@ -42,6 +45,12 @@ untrusted network.
 The web app and API share an origin when served by this binary, so the client needs no permissive
 CORS policy. Use HTTPS at the reverse proxy for browser features that require a secure context,
 including WebGPU on non-localhost addresses; the editor retains its WebGL2 fallback.
+
+Live collaboration is currently limited to one unformatted body paragraph. Its durable update log
+is not compacted, and live edits do not appear in immutable version history; snapshot save and
+restore are disabled for documents that have entered this mode. See
+[the collaboration model and remaining scope](../../docs/collaboration-model.md) before enabling
+it for company documents.
 
 ## Backup service
 

@@ -5,6 +5,7 @@ use wasm_bindgen::closure::Closure;
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{Inbox, Services, UiState, WordApp};
 
+use crate::collaboration::CollaborationBridge;
 use crate::server::ServerBridge;
 
 const DOC_EXTS: &[&str] = &["docx", "docm", "dotx", "odt", "rtf", "txt", "md", "html", "htm", "json"];
@@ -40,14 +41,16 @@ pub fn start() {
                     let inbox: Inbox = Inbox::default();
                     let doc = if query().contains("sample") { wordcraft_engine::sample::sample_document() } else { wordcraft_doc::Document::new() };
                     let server = ServerBridge::new();
-                    let mut app = WordApp::new(Session::new(doc), services(inbox.clone(), cc.egui_ctx.clone(), server.clone()));
+                    let collaboration = CollaborationBridge::new();
+                    let mut app =
+                        WordApp::new(Session::new(doc), services(inbox.clone(), cc.egui_ctx.clone(), server.clone(), collaboration.clone()));
                     if let Some(prefs) = load_preferences() {
                         app.apply_prefs(prefs);
                     }
                     app.autosave = false;
                     let prefs_json = serde_json::to_string(&app.prefs()).unwrap_or_default();
                     let unload_warning = install_unsaved_warning(server.dirty_signal());
-                    Ok(Box::new(WebShell { app, inbox, server, prefs_json, _unload_warning: unload_warning }))
+                    Ok(Box::new(WebShell { app, inbox, server, collaboration, prefs_json, _unload_warning: unload_warning }))
                 }),
             )
             .await;
@@ -70,6 +73,7 @@ struct WebShell {
     app: WordApp,
     inbox: Inbox,
     server: ServerBridge,
+    collaboration: CollaborationBridge,
     prefs_json: String,
     _unload_warning: Option<Closure<dyn FnMut(web_sys::BeforeUnloadEvent)>>,
 }
@@ -92,7 +96,14 @@ impl eframe::App for WebShell {
             });
         }
         self.app.logic(ctx);
-        self.server.logic(&mut self.app, ctx);
+        let document_id = self.server.active_document_id();
+        let collaboration_active = self.collaboration.is_active_for(document_id.as_deref());
+        let snapshot_locked =
+            self.collaboration.snapshot_locked_for(document_id.as_deref()) || self.server.snapshot_locked_for(document_id.as_deref());
+        self.server.logic(&mut self.app, ctx, collaboration_active, snapshot_locked);
+        let document_id = self.server.active_document_id();
+        self.collaboration.logic(&mut self.app.session, document_id.as_deref(), ctx);
+        self.server.sync_dirty_signal(&self.app);
         self.persist_preferences();
     }
 
@@ -102,12 +113,19 @@ impl eframe::App for WebShell {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.app.ui(ui) {
-            self.server.ui(&mut self.app, ui.ctx());
+            let active_id = self.server.active_document_id();
+            let collaboration_active = self.collaboration.is_active_for(active_id.as_deref());
+            let collaboration_save_as_allowed = self.collaboration.can_save_as_copy_for(active_id.as_deref());
+            let snapshot_locked =
+                self.collaboration.snapshot_locked_for(active_id.as_deref()) || self.server.snapshot_locked_for(active_id.as_deref());
+            let readiness = self.server.collaboration_readiness(&self.app);
+            self.server.ui(&mut self.app, ui.ctx(), collaboration_active, snapshot_locked, collaboration_save_as_allowed);
+            self.collaboration.ui(&mut self.app.session, active_id, readiness, ui.ctx());
         }
     }
 }
 
-fn services(inbox: Inbox, ctx: egui::Context, server: ServerBridge) -> Services {
+fn services(inbox: Inbox, ctx: egui::Context, server: ServerBridge, collaboration: CollaborationBridge) -> Services {
     let open_inbox = inbox.clone();
     Services {
         open_async: Some(Box::new(move |purpose: &str| {
@@ -131,6 +149,8 @@ fn services(inbox: Inbox, ctx: egui::Context, server: ServerBridge) -> Services 
         pick_save: Some(Box::new(|name: &str| Some(name.to_string()))),
         download: Some(Box::new(download)),
         server_save: Some(server.save_handler()),
+        collaboration_command: Some(collaboration.command_handler()),
+        collaboration_history: Some(collaboration.history_handler()),
         inbox: Some(inbox),
         ..Default::default()
     }

@@ -66,8 +66,8 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                 }
                 ui.add_space(8.0);
                 qat_button(ui, app, "save", tl!("Save"), "file.save", true);
-                let can_undo = app.session.can_undo();
-                let can_redo = app.session.can_redo();
+                let can_undo = app.can_undo();
+                let can_redo = app.can_redo();
                 qat_button(ui, app, "undo", &crate::i18n::prefixed("Undo", app.session.undo_label().unwrap_or("")), "edit.undo", can_undo);
                 qat_button(ui, app, "redo", tl!("Redo"), "edit.redo", can_redo);
                 qat_button(ui, app, "more", tl!("Customize Quick Access Toolbar"), "ui.dialog", true);
