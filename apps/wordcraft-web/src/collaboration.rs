@@ -3,12 +3,16 @@
 //! The adapter intentionally shares only `body:main`. Rich text, structure, and cursor presence
 //! are outside this mode; the ordinary WordCraft `Session` remains the visible editor model.
 
-use wordcraft_doc::{Block, CharProps, Document, Path, Pos, StoryRef};
+use wordcraft_doc::props::Underline;
+use wordcraft_doc::{Block, CharProps, Document, Path, Pos, Run, StoryRef};
 use wordcraft_engine::{Selection, Session};
+use yrs::types::Attrs;
+use yrs::types::text::YChange;
 use yrs::undo::{Options as UndoOptions, UndoManager};
 use yrs::updates::decoder::Decode;
 use yrs::{
-    Assoc, Doc, GetString, IndexedSequence, OffsetKind, Options as DocOptions, ReadTxn, StateVector, StickyIndex, Text, TextRef, Transact, Update,
+    Any, Assoc, Doc, GetString, IndexedSequence, OffsetKind, Options as DocOptions, Out, ReadTxn, StateVector, StickyIndex, Text, TextRef, Transact,
+    Update,
 };
 
 fn undo_options() -> UndoOptions<()> {
@@ -37,8 +41,11 @@ fn undo_timestamp() -> u64 {
 
 const SHARED_TEXT: &str = "body:main";
 const MAX_SHARED_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const ATTR_BOLD: &str = "wc.bold";
+const ATTR_ITALIC: &str = "wc.italic";
+const ATTR_UNDERLINE: &str = "wc.underline";
 
-/// True only for a document whose entire body is one unformatted, plain-text paragraph.
+/// True only for a document with one plain-text paragraph and supported direct character styles.
 pub fn supported_body_text(document: &Document) -> Option<String> {
     if document.body.len() != 1
         || !document.parts.is_empty()
@@ -54,16 +61,127 @@ pub fn supported_body_text(document: &Document) -> Option<String> {
     if paragraph.text.len() > MAX_SHARED_TEXT_BYTES {
         return None;
     }
+    let run_len = paragraph.runs.iter().try_fold(0usize, |total, run| total.checked_add(run.len));
     if paragraph.props != wordcraft_doc::props::ParaProps::default()
         || paragraph.mark != CharProps::default()
         || paragraph.section.is_some()
         || !paragraph.objects.is_empty()
-        || paragraph.runs.iter().any(|run| run.props != CharProps::default())
+        || paragraph.runs.iter().any(|run| !supported_char_props(&run.props))
+        || run_len != Some(paragraph.text.len())
         || paragraph.text.chars().any(unsupported_text_char)
     {
         return None;
     }
     Some(paragraph.text.clone())
+}
+
+fn supported_char_props(props: &CharProps) -> bool {
+    let supported_underline = props.underline.is_none_or(|underline| matches!(underline, Underline::None | Underline::Single));
+    let allowed = CharProps { bold: props.bold, italic: props.italic, underline: props.underline, ..CharProps::default() };
+    supported_underline && *props == allowed
+}
+
+fn clear_paragraph_mark(document: &mut Document) -> Result<bool, String> {
+    if document.body.len() != 1 {
+        return Err(scope_error());
+    }
+    let Some(block) = document.body.first_mut() else { return Err(scope_error()) };
+    let Block::Para(paragraph) = std::sync::Arc::make_mut(block) else { return Err(scope_error()) };
+    let changed = paragraph.mark != CharProps::default();
+    if changed {
+        paragraph.mark = CharProps::default();
+        paragraph.touch();
+    }
+    Ok(changed)
+}
+
+fn props_for_range(document: &Document, start: usize, end: usize) -> Result<CharProps, String> {
+    if start >= end {
+        return Err("A live text insertion must contain at least one character.".into());
+    }
+    let Some(Block::Para(paragraph)) = document.body.first().map(|block| &**block) else { return Err(scope_error()) };
+    let mut selected_props = None;
+    let mut covered = 0usize;
+    for (range, props) in paragraph.run_ranges() {
+        let overlap_start = range.start.max(start);
+        let overlap_end = range.end.min(end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        if selected_props.as_ref().is_some_and(|selected| selected != props) {
+            return Err("A live text insertion crossed multiple character styles.".into());
+        }
+        selected_props = Some(props.clone());
+        covered = covered.checked_add(overlap_end - overlap_start).ok_or_else(scope_error)?;
+    }
+    if covered != end - start {
+        return Err("The inserted text could not be mapped to one supported character style.".into());
+    }
+    selected_props.ok_or_else(scope_error)
+}
+
+fn attrs_from_props(props: &CharProps) -> Attrs {
+    let mut attributes = Attrs::new();
+    if let Some(value) = props.bold {
+        attributes.insert(std::sync::Arc::from(ATTR_BOLD), Any::Bool(value));
+    }
+    if let Some(value) = props.italic {
+        attributes.insert(std::sync::Arc::from(ATTR_ITALIC), Any::Bool(value));
+    }
+    if let Some(value) = props.underline {
+        attributes.insert(std::sync::Arc::from(ATTR_UNDERLINE), Any::Bool(value == Underline::Single));
+    }
+    attributes
+}
+
+fn props_from_attrs(attributes: Option<&Attrs>) -> Result<CharProps, String> {
+    let mut props = CharProps::default();
+    if let Some(attributes) = attributes {
+        for (key, value) in attributes {
+            let Any::Bool(value) = value else {
+                return Err(format!("live text attribute `{key}` must be a boolean"));
+            };
+            match key.as_ref() {
+                ATTR_BOLD => props.bold = Some(*value),
+                ATTR_ITALIC => props.italic = Some(*value),
+                ATTR_UNDERLINE => props.underline = Some(if *value { Underline::Single } else { Underline::None }),
+                _ => return Err(format!("live text attribute `{key}` is not supported")),
+            }
+        }
+    }
+    Ok(props)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn selection_format_value(document: &Document, id: &str, start: usize, end: usize) -> Result<bool, String> {
+    let Some(Block::Para(paragraph)) = document.body.first().map(|block| &**block) else { return Err(scope_error()) };
+    let mut selected_value = None;
+    let mut selected_any = false;
+    for (range, props) in paragraph.run_ranges() {
+        if range.start >= end || range.end <= start {
+            continue;
+        }
+        selected_any = true;
+        let value = match id {
+            "format.bold" => props.bold.ok_or_else(|| "The selected characters have no live bold value.".to_string())?,
+            "format.italic" => props.italic.ok_or_else(|| "The selected characters have no live italic value.".to_string())?,
+            "format.underline" => match props.underline {
+                Some(Underline::Single) => true,
+                Some(Underline::None) => false,
+                Some(_) => return Err("Only single underline is supported in live text.".into()),
+                None => return Err("The selected characters have no live underline value.".into()),
+            },
+            _ => return Err("Unsupported live formatting command.".into()),
+        };
+        if selected_value.is_some_and(|previous| previous != value) {
+            return Err("The formatting command did not produce one value across the selection.".into());
+        }
+        selected_value = Some(value);
+    }
+    if !selected_any {
+        return Err("Live formatting requires selected text.".into());
+    }
+    selected_value.ok_or_else(|| "Live formatting did not apply to the selection.".into())
 }
 
 fn unsupported_text_char(ch: char) -> bool {
@@ -104,6 +222,41 @@ impl LiveText {
         self.text.get_string(&self.doc.transact())
     }
 
+    fn shared_text_and_runs(&self) -> Result<(String, Vec<Run>), String> {
+        let transaction = self.doc.transact();
+        let mut value = String::new();
+        let mut runs: Vec<Run> = Vec::new();
+        for chunk in self.text.diff(&transaction, YChange::identity) {
+            let Out::Any(Any::String(chunk_text)) = chunk.insert else {
+                return Err("Live text supports plain text only; embedded objects are blocked.".into());
+            };
+            let chunk_text = chunk_text.as_ref();
+            if chunk_text.chars().any(unsupported_text_char) {
+                return Err(scope_error());
+            }
+            let props = props_from_attrs(chunk.attributes.as_deref())?;
+            if !chunk_text.is_empty() {
+                if let Some(last) = runs.last_mut().filter(|last| last.props == props) {
+                    last.len = last.len.saturating_add(chunk_text.len());
+                } else {
+                    runs.push(Run { len: chunk_text.len(), props });
+                }
+                value.push_str(chunk_text);
+            }
+        }
+        if value.len() > MAX_SHARED_TEXT_BYTES {
+            return Err(scope_error());
+        }
+        Ok((value, runs))
+    }
+
+    fn editor_matches_shared(&self, document: &Document) -> Result<bool, String> {
+        let Some(editor_text) = supported_body_text(document) else { return Ok(false) };
+        let (shared_text, shared_runs) = self.shared_text_and_runs()?;
+        let Block::Para(paragraph) = &**document.body.first().ok_or_else(scope_error)? else { return Ok(false) };
+        Ok(editor_text == shared_text && paragraph.runs == shared_runs)
+    }
+
     fn state_vector(&self) -> StateVector {
         self.doc.transact().state_vector()
     }
@@ -126,13 +279,13 @@ impl LiveText {
                     .into(),
             );
         }
-        let old_anchors = if local_value == editor_value { self.capture_selection(session).ok() } else { None };
+        let old_anchors = if self.editor_matches_shared(&session.doc)? { self.capture_selection(session).ok() } else { None };
 
         let local_update = Update::decode_v1(bytes).map_err(|error| format!("invalid live text update: {error}"))?;
         self.doc.transact_mut().apply_update(local_update).map_err(|error| format!("could not apply live text state: {error}"))?;
         let merged_value = self.text();
         validate_shared_text(&merged_value)?;
-        if merged_value != editor_value {
+        if merged_value != editor_value || !self.editor_matches_shared(&session.doc)? {
             self.project_text(session, &merged_value, old_anchors, session.sel.clone())?;
         }
         if self.undo.is_none() {
@@ -149,14 +302,14 @@ impl LiveText {
     fn apply_remote_update(&mut self, session: &mut Session, bytes: &[u8]) -> Result<bool, String> {
         let update = Update::decode_v1(bytes).map_err(|error| format!("invalid live text update: {error}"))?;
         let before = supported_body_text(&session.doc).ok_or_else(scope_error)?;
-        if before != self.text() {
+        if !self.editor_matches_shared(&session.doc)? {
             return Err("The editor and live text are out of sync. Editing was paused to protect the document.".into());
         }
         let anchors = self.capture_selection(session)?;
         self.doc.transact_mut().apply_update(update).map_err(|error| format!("could not apply live text update: {error}"))?;
         let after = self.text();
         validate_shared_text(&after)?;
-        if after == before {
+        if after == before && self.editor_matches_shared(&session.doc)? {
             return Ok(false);
         }
         self.project_text(session, &after, Some(anchors), session.sel.clone())?;
@@ -174,37 +327,70 @@ impl LiveText {
             session.reset_history();
             return Ok(None);
         };
-        if !before.is_char_boundary(start) || !before.is_char_boundary(old_end) || !after.is_char_boundary(start) {
+        let inserted_end = start.checked_add(inserted.len()).ok_or_else(scope_error)?;
+        if !before.is_char_boundary(start)
+            || !before.is_char_boundary(old_end)
+            || !after.is_char_boundary(start)
+            || !after.is_char_boundary(inserted_end)
+        {
             return Err("The text edit did not fall on a UTF-8 character boundary.".into());
         }
-        let start = byte_to_utf16_offset(before, start)?;
-        let old_end = byte_to_utf16_offset(before, old_end)?;
-        let remove_len = old_end.saturating_sub(start);
+        let insert_attributes = if inserted.is_empty() { None } else { Some(attrs_from_props(&props_for_range(&session.doc, start, inserted_end)?)) };
+        let start_utf16 = byte_to_utf16_offset(before, start)?;
+        let old_end_utf16 = byte_to_utf16_offset(before, old_end)?;
+        let remove_len = old_end_utf16.saturating_sub(start_utf16);
         let prior_state = self.state_vector();
         {
             let mut transaction = self.doc.transact_mut_with(self.doc.client_id());
             if remove_len > 0 {
-                self.text.remove_range(&mut transaction, start, remove_len);
+                self.text.remove_range(&mut transaction, start_utf16, remove_len);
             }
-            if !inserted.is_empty() {
-                self.text.insert(&mut transaction, start, inserted);
+            if let Some(attributes) = insert_attributes {
+                self.text.insert_with_attributes(&mut transaction, start_utf16, inserted, attributes);
             }
         }
         let shared_after = self.text();
         validate_shared_text(&shared_after)?;
         session.reset_history();
-        if shared_after != after {
+        if shared_after != after || !self.editor_matches_shared(&session.doc)? {
             self.project_text(session, &shared_after, None, session.sel.clone())?;
         }
         if shared_after == before { Ok(None) } else { Ok(Some(self.doc.transact().encode_state_as_update_v1(&prior_state))) }
     }
 
+    fn apply_format_update(&mut self, id: &str, start_byte: usize, end_byte: usize, value: bool) -> Result<Option<Vec<u8>>, String> {
+        let current = self.text();
+        if start_byte >= end_byte {
+            return Err("Live formatting requires a non-empty selection.".into());
+        }
+        let start = byte_to_utf16_offset(&current, start_byte)?;
+        let end = byte_to_utf16_offset(&current, end_byte)?;
+        let attribute = match id {
+            "format.bold" => ATTR_BOLD,
+            "format.italic" => ATTR_ITALIC,
+            "format.underline" => ATTR_UNDERLINE,
+            _ => return Err("Unsupported live formatting command.".into()),
+        };
+        let prior_state = self.state_vector();
+        let mut attributes = Attrs::new();
+        attributes.insert(std::sync::Arc::from(attribute), Any::Bool(value));
+        {
+            let mut transaction = self.doc.transact_mut_with(self.doc.client_id());
+            self.text.format(&mut transaction, start, end - start, attributes);
+        }
+        if self.text() != current {
+            return Err("A live formatting update changed the paragraph text.".into());
+        }
+        if self.state_vector() == prior_state { Ok(None) } else { Ok(Some(self.doc.transact().encode_state_as_update_v1(&prior_state))) }
+    }
+
     fn undo_or_redo(&mut self, session: &mut Session, redo: bool) -> Result<Option<Vec<u8>>, String> {
         let current = supported_body_text(&session.doc).ok_or_else(scope_error)?;
-        if current != self.text() {
+        if current != self.text() || !self.editor_matches_shared(&session.doc)? {
             return Err("The editor is catching up with live text. Undo was paused to protect the document.".into());
         }
         let anchors = self.capture_selection(session)?;
+        let prior_shared = self.shared_text_and_runs()?;
         let prior_state = self.state_vector();
         let undo = self.undo.as_mut().ok_or_else(|| "Live undo is not ready yet.".to_string())?;
         let changed = if redo { undo.redo_blocking() } else { undo.undo_blocking() };
@@ -213,11 +399,11 @@ impl LiveText {
         }
         let updated = self.text();
         validate_shared_text(&updated)?;
-        if updated != current {
+        if updated != current || !self.editor_matches_shared(&session.doc)? {
             self.project_text(session, &updated, Some(anchors), session.sel.clone())?;
         }
         session.reset_history();
-        if updated == current { Ok(None) } else { Ok(Some(self.doc.transact().encode_state_as_update_v1(&prior_state))) }
+        if self.shared_text_and_runs()? == prior_shared { Ok(None) } else { Ok(Some(self.doc.transact().encode_state_as_update_v1(&prior_state))) }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -279,12 +465,26 @@ impl LiveText {
         } else {
             None
         };
+        let (shared_value, shared_runs) = self.shared_text_and_runs()?;
+        if shared_value != value {
+            return Err("The live text body and formatting are out of sync. Editing was paused to protect the document.".into());
+        }
         let paragraph = session.doc.para_mut(StoryRef::Body, &Path::top(0)).map_err(|error| error.to_string())?;
         let len = paragraph.len();
         paragraph.delete(0, len).map_err(|error| error.to_string())?;
-        if !value.is_empty() {
-            paragraph.insert_text(0, value, &CharProps::default()).map_err(|error| error.to_string())?;
+        let mut offset = 0usize;
+        for run in shared_runs {
+            let end = offset.checked_add(run.len).ok_or_else(scope_error)?;
+            let chunk = value.get(offset..end).ok_or_else(scope_error)?;
+            if !chunk.is_empty() {
+                paragraph.insert_text(offset, chunk, &run.props).map_err(|error| error.to_string())?;
+            }
+            offset = end;
         }
+        if offset != value.len() {
+            return Err("The live text run lengths do not match the paragraph body.".into());
+        }
+        paragraph.mark = CharProps::default();
         paragraph.touch();
         if let Some(selection) = resolved_selection {
             session.sel = selection;
@@ -402,7 +602,7 @@ fn one_splice<'a>(before: &str, after: &'a str) -> Option<(usize, usize, &'a str
 }
 
 fn scope_error() -> String {
-    "Live editing is limited to one plain-text body paragraph up to 8 MiB. Save or open a supported text-only document first.".into()
+    "Live editing is limited to one body paragraph up to 8 MiB, with plain text plus bold, italic, and single underline on selected text. Save or open a supported document first.".into()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -599,8 +799,8 @@ impl CollaborationBridge {
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.label("Text-only scope: one plain-text body paragraph. Formatting, paste, paragraph breaks, and document structure changes are blocked.");
-                ui.small("Changes are durably saved as live text updates. Version history does not include live edits; restore is disabled. No shared cursors or presence are provided.");
+                ui.label("Scope: one body paragraph with plain text, bold, italic, and single underline on selected text. Other formatting, paste, paragraph breaks, and structure changes are blocked.");
+                ui.small("Text and selected-format changes are durably saved as live updates. Version history does not include live edits; restore is disabled. No shared cursors or presence are provided.");
                 ui.separator();
                 ui.label(status);
                 if snapshot_locked && phase == ConnectionPhase::Inactive {
@@ -622,7 +822,7 @@ impl CollaborationBridge {
                         ui.add_enabled(false, egui::Button::new("Connecting…"));
                     }
                     ConnectionPhase::Live => {
-                        ui.colored_label(egui::Color32::LIGHT_GREEN, "Live text updates are being persisted by the server.");
+                        ui.colored_label(egui::Color32::LIGHT_GREEN, "Live text and formatting updates are being persisted by the server.");
                         if ui.button("Pause connection").clicked() {
                             disconnect = true;
                         }
@@ -843,6 +1043,12 @@ impl BridgeState {
             }
             return Some(self.undo_or_redo(session, id == "edit.redo"));
         }
+        if matches!(id, "format.bold" | "format.italic" | "format.underline") {
+            if self.phase != ConnectionPhase::Live {
+                return Some(Err("Formatting is paused until the live text connection is ready. Reconnect to continue.".into()));
+            }
+            return Some(self.local_format_command(session, id, params));
+        }
         if matches!(id, "text.insert" | "text.backspace" | "text.delete") {
             if self.phase != ConnectionPhase::Live {
                 return Some(Err("Editing is paused until the live text connection is ready. Reconnect to continue.".into()));
@@ -853,13 +1059,110 @@ impl BridgeState {
         if !spec.mutates {
             return None;
         }
-        Some(Err("This live session is text-only. Formatting, paste, paragraph breaks, and document structure changes are blocked.".into()))
+        Some(Err("This live session supports plain text plus bold, italic, and single underline on a selection. Paste, paragraph breaks, and document structure changes are blocked.".into()))
+    }
+
+    fn local_format_command(&mut self, session: &mut Session, id: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+        if session.sel.is_collapsed() {
+            return Err("Live formatting requires a non-empty selection. Pending formatting at the caret is not supported.".into());
+        }
+        if id == "format.underline"
+            && params.get("value").and_then(serde_json::Value::as_bool) != Some(false)
+            && params.get("style").and_then(serde_json::Value::as_str).is_some_and(|style| style != "single")
+        {
+            return Err("Live text supports single underline only.".into());
+        }
+        let before = supported_body_text(&session.doc).ok_or_else(scope_error)?;
+        if !self
+            .adapter
+            .as_ref()
+            .ok_or_else(|| "Live text state is unavailable. Reconnect to continue.".to_string())?
+            .editor_matches_shared(&session.doc)?
+        {
+            return Err("The editor is catching up with live text. Formatting was paused to protect the document.".into());
+        }
+        let (start, end) = session.sel.ordered();
+        if start.story != StoryRef::Body || end.story != StoryRef::Body || start.path != Path::top(0) || end.path != Path::top(0) || start == end {
+            return Err("Live formatting supports a non-empty selection in the body paragraph only.".into());
+        }
+        let before_document = session.doc.clone();
+        let before_selection = session.sel.clone();
+        let result = match session.run(id, params) {
+            Ok(result) => result,
+            Err(error) => {
+                session.reset_history();
+                return Err(error.to_string());
+            }
+        };
+        if let Err(error) = clear_paragraph_mark(&mut session.doc) {
+            session.doc = before_document;
+            session.sel = before_selection;
+            session.reset_history();
+            session.touch();
+            session.relayout();
+            return Err(error);
+        }
+        if supported_body_text(&session.doc).as_deref() != Some(before.as_str()) {
+            session.doc = before_document;
+            session.sel = before_selection;
+            session.reset_history();
+            session.touch();
+            session.relayout();
+            return Err("Live formatting changed the body text unexpectedly; the edit was reverted.".into());
+        }
+        let formatted = match selection_format_value(&session.doc, id, start.off, end.off) {
+            Ok(value) => value,
+            Err(error) => {
+                session.doc = before_document;
+                session.sel = before_selection;
+                session.reset_history();
+                session.touch();
+                session.relayout();
+                return Err(error);
+            }
+        };
+        let adapter = self.adapter.as_mut().ok_or_else(|| "Live text state is unavailable. Reconnect to continue.".to_string())?;
+        let update = match adapter.apply_format_update(id, start.off, end.off, formatted) {
+            Ok(update) => update,
+            Err(error) => {
+                session.doc = before_document;
+                session.sel = before_selection;
+                session.reset_history();
+                session.touch();
+                session.relayout();
+                return Err(error);
+            }
+        };
+        let updated = adapter.text();
+        if let Err(error) = adapter.project_text(session, &updated, None, session.sel.clone()) {
+            session.doc = before_document;
+            session.sel = before_selection;
+            session.reset_history();
+            session.touch();
+            session.relayout();
+            self.phase = ConnectionPhase::Faulted;
+            self.status = format!("Formatting could not be projected safely: {error}");
+            self.close_socket();
+            return Err(self.status.clone());
+        }
+        session.reset_history();
+        if let Some(update) = update
+            && let Err(error) = self.send_update(&update)
+        {
+            self.phase = ConnectionPhase::Offline;
+            self.status =
+                format!("Connection lost while sending formatting: {error}. The edit remains in this browser; reconnect before continuing.");
+        }
+        if self.pending_updates.is_empty() {
+            session.dirty = false;
+        }
+        Ok(result)
     }
 
     fn local_text_command(&mut self, session: &mut Session, id: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
         let current = supported_body_text(&session.doc).ok_or_else(scope_error)?;
         let adapter = self.adapter.as_mut().ok_or_else(|| "Live text state is unavailable. Reconnect to continue.".to_string())?;
-        if adapter.text() != current {
+        if adapter.text() != current || !adapter.editor_matches_shared(&session.doc)? {
             return Err("The editor is catching up with live text. Wait for the update before typing.".into());
         }
         let before_document = session.doc.clone();
@@ -869,7 +1172,7 @@ impl BridgeState {
             if let Some(text) = params.get("text").and_then(serde_json::Value::as_str)
                 && text.chars().any(unsupported_text_char)
             {
-                return Err("This live session supports one plain-text paragraph. Paragraph breaks and control characters are blocked.".into());
+                return Err("Live text supports one paragraph. Paragraph breaks and control characters are blocked.".into());
             }
             if let Some(object) = command_params.as_object_mut() {
                 object.insert("raw".into(), serde_json::Value::Bool(true));
@@ -880,6 +1183,17 @@ impl BridgeState {
             Err(error) => {
                 session.reset_history();
                 return Err(error.to_string());
+            }
+        };
+        let paragraph_mark_cleared = match clear_paragraph_mark(&mut session.doc) {
+            Ok(cleared) => cleared,
+            Err(error) => {
+                session.doc = before_document;
+                session.sel = before_selection;
+                session.reset_history();
+                session.touch();
+                session.relayout();
+                return Err(error);
             }
         };
         let update = match adapter.apply_local_editor_change(session, &current) {
@@ -893,6 +1207,10 @@ impl BridgeState {
                 return Err(error);
             }
         };
+        if paragraph_mark_cleared {
+            session.touch();
+            session.relayout();
+        }
         if let Some(update) = update
             && let Err(error) = self.send_update(&update)
         {
@@ -941,7 +1259,7 @@ impl BridgeState {
             } else if result.local_state_acknowledged {
                 session.dirty = false;
                 self.status =
-                    "Live. The server confirmed all pending text updates. Version history excludes these edits. No cursor presence is shared.".into();
+                    "Live. The server confirmed all pending text and formatting updates. Version history excludes these edits. No cursor presence is shared.".into();
             } else if let Some(update) = result.catch_up {
                 session.dirty = true;
                 if let Err(error) = self.send_update(&update) {
@@ -951,7 +1269,8 @@ impl BridgeState {
             } else {
                 session.dirty = false;
                 self.status =
-                    "Live. The server confirmed all text updates. Version history excludes these edits. No cursor presence is shared.".into();
+                    "Live. The server confirmed all text and formatting updates. Version history excludes these edits. No cursor presence is shared."
+                        .into();
             }
         } else {
             let acknowledged = self.pending_updates.iter().position(|pending| pending.as_slice() == bytes);
@@ -962,12 +1281,13 @@ impl BridgeState {
             if self.pending_updates.is_empty() {
                 session.dirty = false;
                 self.status =
-                    "Live. The server confirmed all text updates. Version history excludes these edits. No cursor presence is shared.".into();
+                    "Live. The server confirmed all text and formatting updates. Version history excludes these edits. No cursor presence is shared."
+                        .into();
             } else {
                 self.status = format!("Syncing live text… {} update(s) await server confirmation.", self.pending_updates.len());
             }
             if changed && self.pending_updates.is_empty() {
-                self.status = "Live. Remote text was applied to the existing editor; all updates are durably stored. Version history excludes live edits. No cursor presence is shared.".into();
+                self.status = "Live. Remote text or formatting was applied to the existing editor; all updates are durably stored. Version history excludes live edits. No cursor presence is shared.".into();
             }
         }
         Ok(())
@@ -1028,7 +1348,10 @@ fn browser_error(error: wasm_bindgen::JsValue) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LiveText, MAX_SHARED_TEXT_BYTES, one_splice, resolve_sticky, supported_body_text, validate_shared_text};
+    use super::{
+        ATTR_BOLD, Any, Attrs, LiveText, MAX_SHARED_TEXT_BYTES, one_splice, resolve_sticky, selection_format_value, supported_body_text,
+        validate_shared_text,
+    };
     use serde_json::json;
     use wordcraft_doc::{Block, CharProps, Document};
     use wordcraft_engine::{Selection, Session};
@@ -1053,6 +1376,22 @@ mod tests {
         doc.transact().encode_state_as_update_v1(&StateVector::default())
     }
 
+    fn formatted_seed(text: &str, start: u32, len: u32, attribute: &str, value: bool) -> Vec<u8> {
+        let doc = Doc::with_options(super::DocOptions { offset_kind: super::OffsetKind::Utf16, ..super::DocOptions::default() });
+        let shared = doc.get_or_insert_text(super::SHARED_TEXT);
+        let mut transaction = doc.transact_mut();
+        shared.insert(&mut transaction, 0, text);
+        let attributes = Attrs::from([(std::sync::Arc::from(attribute), Any::Bool(value))]);
+        shared.format(&mut transaction, start, len, attributes);
+        drop(transaction);
+        doc.transact().encode_state_as_update_v1(&StateVector::default())
+    }
+
+    fn props_at(document: &Document, offset: usize) -> CharProps {
+        let Some(Block::Para(paragraph)) = document.body.first().map(|block| &**block) else { return CharProps::default() };
+        paragraph.run_ranges().find(|(range, _)| range.start <= offset && offset < range.end).map(|(_, props)| props.clone()).unwrap_or_default()
+    }
+
     fn edit(adapter: &mut LiveText, session: &mut Session, id: &str, params: serde_json::Value) -> Vec<u8> {
         let before = supported_body_text(&session.doc).unwrap_or_default();
         session.run(id, &params).expect("editor command succeeds");
@@ -1064,13 +1403,137 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_one_unformatted_plain_text_body_paragraph() {
+    fn accepts_only_one_plain_text_body_paragraph_with_supported_character_styles() {
         assert_eq!(supported_body_text(&Document::from_text("hello")), Some("hello".into()));
         assert!(supported_body_text(&Document::from_text("one\ntwo")).is_none());
         let mut formatted = Document::from_text("hello");
-        let Block::Para(paragraph) = std::sync::Arc::make_mut(&mut formatted.body[0]) else { return };
-        paragraph.runs[0].props = CharProps { bold: Some(true), ..CharProps::default() };
+        {
+            let Block::Para(paragraph) = std::sync::Arc::make_mut(&mut formatted.body[0]) else { return };
+            paragraph.runs[0].props = CharProps { bold: Some(true), ..CharProps::default() };
+        }
+        assert_eq!(supported_body_text(&formatted), Some("hello".into()));
+        {
+            let Block::Para(paragraph) = std::sync::Arc::make_mut(&mut formatted.body[0]) else { return };
+            paragraph.runs[0].props.italic = Some(false);
+            paragraph.runs[0].props.underline = Some(wordcraft_doc::props::Underline::Single);
+        }
+        assert_eq!(supported_body_text(&formatted), Some("hello".into()));
+        {
+            let Block::Para(paragraph) = std::sync::Arc::make_mut(&mut formatted.body[0]) else { return };
+            paragraph.runs[0].props.underline = Some(wordcraft_doc::props::Underline::Double);
+        }
         assert!(supported_body_text(&formatted).is_none());
+        {
+            let Block::Para(paragraph) = std::sync::Arc::make_mut(&mut formatted.body[0]) else { return };
+            paragraph.runs[0].props.font = Some("Aptos".into());
+        }
+        assert!(supported_body_text(&formatted).is_none());
+    }
+
+    #[test]
+    fn formatted_server_state_projects_supported_runs_into_the_existing_document() {
+        let value = "前😀後";
+        let initial = formatted_seed(value, 1, 2, ATTR_BOLD, true);
+        let mut session = Session::new(Document::from_text(value));
+        let mut adapter = LiveText::new();
+
+        adapter.apply_full_state(&mut session, &initial).expect("formatted server state applies");
+
+        assert_eq!(supported_body_text(&session.doc), Some(value.into()));
+        assert_eq!(props_at(&session.doc, "前".len()).bold, Some(true));
+        assert_eq!(props_at(&session.doc, "前😀".len()).bold, None);
+    }
+
+    #[test]
+    fn typing_inside_a_formatted_run_preserves_character_styles_for_both_clients() {
+        let initial = formatted_seed("ab", 0, 2, ATTR_BOLD, true);
+        let mut alice_session = Session::new(Document::from_text("ab"));
+        let mut bob_session = Session::new(Document::from_text("ab"));
+        let mut alice = LiveText::new();
+        let mut bob = LiveText::new();
+        alice.apply_full_state(&mut alice_session, &initial).expect("Alice receives formatted seed");
+        bob.apply_full_state(&mut bob_session, &initial).expect("Bob receives formatted seed");
+
+        alice_session.sel = Selection::caret(wordcraft_doc::Pos::body(0, 1));
+        let alice_insert = edit(&mut alice, &mut alice_session, "text.insert", json!({"text":"X", "raw":true}));
+        update(&mut bob, &mut bob_session, &alice_insert);
+
+        assert_eq!(supported_body_text(&alice_session.doc), Some("aXb".into()));
+        assert_eq!(supported_body_text(&bob_session.doc), Some("aXb".into()));
+        for offset in 0..3 {
+            assert_eq!(props_at(&alice_session.doc, offset).bold, Some(true));
+            assert_eq!(props_at(&bob_session.doc, offset).bold, Some(true));
+        }
+        assert!(alice.editor_matches_shared(&alice_session.doc).expect("Alice matches shared styles"));
+        assert!(bob.editor_matches_shared(&bob_session.doc).expect("Bob matches shared styles"));
+    }
+
+    #[test]
+    fn live_format_update_syncs_and_actor_undo_preserves_remote_text() {
+        let initial = seed("text");
+        let mut alice_session = Session::new(Document::from_text("text"));
+        let mut bob_session = Session::new(Document::from_text("text"));
+        let mut alice = LiveText::new();
+        let mut bob = LiveText::new();
+        alice.apply_full_state(&mut alice_session, &initial).expect("Alice receives seed");
+        bob.apply_full_state(&mut bob_session, &initial).expect("Bob receives seed");
+
+        bob_session.sel = Selection::caret(wordcraft_doc::Pos::body(0, "text".len()));
+        let bob_insert = edit(&mut bob, &mut bob_session, "text.insert", json!({"text":" B", "raw":true}));
+        update(&mut alice, &mut alice_session, &bob_insert);
+        alice_session.sel = Selection { anchor: wordcraft_doc::Pos::body(0, 0), focus: wordcraft_doc::Pos::body(0, "text".len()) };
+        alice_session.run("format.bold", &json!({"value":true})).expect("Alice formats selection");
+        super::clear_paragraph_mark(&mut alice_session.doc).expect("paragraph mark remains unformatted");
+        let bold = selection_format_value(&alice_session.doc, "format.bold", 0, "text".len()).expect("selection has bold value");
+        let format_update =
+            alice.apply_format_update("format.bold", 0, "text".len(), bold).expect("format update encodes").expect("format changes shared state");
+        update(&mut bob, &mut bob_session, &format_update);
+        for (id, params) in [("format.italic", json!({"value":true})), ("format.underline", json!({"value":true}))] {
+            alice_session.run(id, &params).expect("Alice applies another supported character style");
+            super::clear_paragraph_mark(&mut alice_session.doc).expect("paragraph mark remains unformatted");
+            let value = selection_format_value(&alice_session.doc, id, 0, "text".len()).expect("selection has the applied style");
+            let format_update =
+                alice.apply_format_update(id, 0, "text".len(), value).expect("format update encodes").expect("style changes shared state");
+            update(&mut bob, &mut bob_session, &format_update);
+        }
+        assert_eq!(supported_body_text(&alice_session.doc), Some("text B".into()));
+        assert_eq!(supported_body_text(&bob_session.doc), Some("text B".into()));
+        assert_eq!(props_at(&bob_session.doc, 0).bold, Some(true));
+        assert_eq!(props_at(&bob_session.doc, 0).italic, Some(true));
+        assert_eq!(props_at(&bob_session.doc, 0).underline, Some(wordcraft_doc::props::Underline::Single));
+        assert_eq!(props_at(&bob_session.doc, "text ".len()).bold, None);
+
+        let undo = alice.undo_or_redo(&mut alice_session, false).expect("format undo succeeds").expect("format undo emits update");
+        update(&mut bob, &mut bob_session, &undo);
+        assert_eq!(supported_body_text(&alice_session.doc), Some("text B".into()));
+        assert_eq!(supported_body_text(&bob_session.doc), Some("text B".into()));
+        assert_eq!(props_at(&bob_session.doc, 0), CharProps::default());
+        assert_eq!(props_at(&bob_session.doc, "text ".len()), CharProps::default());
+
+        let redo = alice.undo_or_redo(&mut alice_session, true).expect("format redo succeeds").expect("format redo emits update");
+        update(&mut bob, &mut bob_session, &redo);
+        assert_eq!(supported_body_text(&alice_session.doc), Some("text B".into()));
+        assert_eq!(supported_body_text(&bob_session.doc), Some("text B".into()));
+        assert_eq!(props_at(&alice_session.doc, 0).bold, Some(true));
+        assert_eq!(props_at(&bob_session.doc, 0).bold, Some(true));
+    }
+
+    #[test]
+    fn deleting_all_formatted_text_keeps_an_empty_supported_paragraph() {
+        let initial = formatted_seed("bold", 0, 4, super::ATTR_BOLD, true);
+        let mut session = Session::new(Document::from_text("bold"));
+        let mut adapter = LiveText::new();
+        adapter.apply_full_state(&mut session, &initial).expect("formatted server state applies");
+        session.sel = Selection { anchor: wordcraft_doc::Pos::body(0, 0), focus: wordcraft_doc::Pos::body(0, 4) };
+        let before = "bold";
+        session.run("text.delete", &json!({})).expect("selected text deletes");
+        super::clear_paragraph_mark(&mut session.doc).expect("paragraph mark resets");
+
+        let update_bytes =
+            adapter.apply_local_editor_change(&mut session, before).expect("deletion becomes a CRDT update").expect("delete emits update");
+        assert_eq!(supported_body_text(&session.doc), Some(String::new()));
+        assert!(!update_bytes.is_empty());
+        assert_eq!(adapter.text(), "");
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Local, durable document storage for the WordCraft browser editor.
 //!
 //! Snapshot writes use compare-and-swap versions. A stale client receives a conflict and cannot
-//! silently replace a newer snapshot. A narrow WebSocket prototype syncs one plain-text paragraph;
+//! silently replace a newer snapshot. A narrow WebSocket prototype syncs one paragraph with plain
+//! text and selected character styles;
 //! it is not a rich-document collaboration adapter for the browser editor.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -27,8 +28,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
-use yrs::updates::decoder::Decode;
-use yrs::{Any, Doc, GetString, Out, ReadTxn, StateVector, Text, Transact, Update};
+use yrs::block::{BLOCK_GC_REF_NUMBER, BLOCK_SKIP_REF_NUMBER, HAS_ORIGIN, HAS_PARENT_SUB, HAS_RIGHT_ORIGIN, ItemContent};
+use yrs::encoding::read::Read as _;
+use yrs::types::Attrs;
+use yrs::updates::decoder::{Decode, Decoder, DecoderV1};
+use yrs::{Any, Doc, IdSet, Out, ReadTxn, StateVector, Text, Transact, Update};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TITLE_CHARS: usize = 240;
@@ -726,8 +730,7 @@ impl Store {
         } else {
             let snapshot = serde_json::from_slice::<Value>(&row.0).map_err(|error| StoreError::Corrupt(error.to_string()))?;
             let document = wordcraft_engine::io::document_from_storage_snapshot(&snapshot).map_err(|error| StoreError::Corrupt(error.to_string()))?;
-            let text = collaboration_seed_text(&document)?;
-            let seed_update = make_collaboration_seed(&text)?;
+            let seed_update = make_collaboration_seed(&document)?;
             transaction
                 .execute("INSERT INTO collaboration_documents(document_id, epoch, seed_update) VALUES(?1, 1, ?2)", params![id, seed_update])?;
             (1, seed_update)
@@ -748,7 +751,15 @@ impl Store {
         Ok(CollaborationData { epoch, seed_update, updates })
     }
 
-    fn append_collaboration_update(&self, id: &str, epoch: u64, digest: &[u8], update: &[u8], text: &str) -> Result<bool, StoreError> {
+    fn append_collaboration_update(
+        &self,
+        id: &str,
+        epoch: u64,
+        digest: &[u8],
+        update: &[u8],
+        text: &str,
+        runs: &[wordcraft_doc::Run],
+    ) -> Result<bool, StoreError> {
         if digest.len() != 32 || Sha256::digest(update).as_slice() != digest {
             return Err(StoreError::InvalidCollaborationUpdate("update digest does not match payload".into()));
         }
@@ -789,8 +800,10 @@ impl Store {
         // remain separate from the collaboration epoch and update log.
         let snapshot = serde_json::from_slice::<Value>(&document_row.1).map_err(|error| StoreError::Corrupt(error.to_string()))?;
         let mut document = wordcraft_engine::io::document_from_storage_snapshot(&snapshot).map_err(|error| StoreError::Corrupt(error.to_string()))?;
-        let _ = collaboration_seed_text(&document)?;
-        document.body = vec![wordcraft_doc::para_block(wordcraft_doc::Paragraph::with_text(text, wordcraft_doc::CharProps::default()))];
+        let _ = collaboration_seed_content(&document)?;
+        let mut paragraph = wordcraft_doc::Paragraph::with_text(text, wordcraft_doc::CharProps::default());
+        paragraph.runs = runs.to_vec();
+        document.body = vec![wordcraft_doc::para_block(paragraph)];
         document.core.modified = wordcraft_engine::cmd::now_iso();
         let snapshot = wordcraft_engine::io::storage_snapshot(&document).map_err(StoreError::InvalidSnapshot)?;
         let snapshot_bytes = serde_json::to_vec(&snapshot)?;
@@ -958,6 +971,7 @@ impl CollaborationRoom {
         if bytes.is_empty() || bytes.len() > MAX_COLLAB_UPDATE_BYTES {
             return Err(StoreError::InvalidCollaborationUpdate("update is empty or exceeds the message size limit".into()));
         }
+        validate_collaboration_update_attributes(bytes).map_err(StoreError::InvalidCollaborationUpdate)?;
         let digest = Sha256::digest(bytes).to_vec();
         let mut state = self.state.lock().map_err(|_| StoreError::CollaborationLock)?;
         if state.digests.contains(&digest) {
@@ -968,8 +982,8 @@ impl CollaborationRoom {
         let current_state = state.document.transact().encode_state_as_update_v1(&StateVector::default());
         let candidate = rebuild_collaboration_document(&current_state, std::slice::from_ref(&update), true)?;
 
-        let text = collaboration_text(&candidate)?;
-        let inserted = store.append_collaboration_update(&self.id, self.epoch, &digest, bytes, &text)?;
+        let (text, runs) = collaboration_content(&candidate).map_err(StoreError::InvalidCollaborationUpdate)?;
+        let inserted = store.append_collaboration_update(&self.id, self.epoch, &digest, bytes, &text, &runs)?;
         if !inserted {
             // This can happen if another server process stored the same payload while this room
             // was running. Refresh from the durable log and avoid a duplicate broadcast.
@@ -990,7 +1004,7 @@ impl CollaborationRoom {
     }
 }
 
-fn collaboration_seed_text(document: &wordcraft_doc::Document) -> Result<String, StoreError> {
+fn collaboration_seed_content(document: &wordcraft_doc::Document) -> Result<(String, Vec<wordcraft_doc::Run>), StoreError> {
     if document.settings.track_changes || document.settings.protection.is_some() {
         return Err(StoreError::UnsupportedCollaborationDocument("track changes and document protection are not supported".into()));
     }
@@ -1004,7 +1018,7 @@ fn collaboration_seed_text(document: &wordcraft_doc::Document) -> Result<String,
         return Err(StoreError::UnsupportedCollaborationDocument("tables are not supported".into()));
     };
     let run_len = paragraph.runs.iter().try_fold(0usize, |total, run| total.checked_add(run.len));
-    let plain_runs = run_len == Some(paragraph.text.len()) && paragraph.runs.iter().all(|run| run.props.is_empty());
+    let runs_cover_text = run_len == Some(paragraph.text.len());
     if !paragraph.props.is_empty()
         || !paragraph.mark.is_empty()
         || paragraph.section.is_some()
@@ -1012,22 +1026,85 @@ fn collaboration_seed_text(document: &wordcraft_doc::Document) -> Result<String,
         || paragraph.text.contains('\n')
         || paragraph.text.contains('\r')
         || paragraph.text.chars().any(unsupported_collaboration_char)
-        || !plain_runs
+        || !runs_cover_text
     {
-        return Err(StoreError::UnsupportedCollaborationDocument("formatting, inline objects, and section breaks are not supported".into()));
+        return Err(StoreError::UnsupportedCollaborationDocument(
+            "paragraph formatting, pending mark formatting, inline objects, and section breaks are not supported".into(),
+        ));
     }
     if paragraph.text.len() > MAX_COLLAB_TEXT_BYTES {
         return Err(StoreError::UnsupportedCollaborationDocument("the body paragraph exceeds the collaboration size limit".into()));
     }
-    Ok(paragraph.text.clone())
+    let mut byte_offset = 0usize;
+    for run in &paragraph.runs {
+        if !collaboration_run_props_are_supported(&run.props) {
+            return Err(StoreError::UnsupportedCollaborationDocument(
+                "only direct bold, italic, and single underline character properties are supported".into(),
+            ));
+        }
+        let end = byte_offset
+            .checked_add(run.len)
+            .ok_or_else(|| StoreError::UnsupportedCollaborationDocument("run offsets exceed the body paragraph size".into()))?;
+        if paragraph.text.get(byte_offset..end).is_none() {
+            return Err(StoreError::UnsupportedCollaborationDocument("run boundaries must align with UTF-8 character boundaries".into()));
+        }
+        byte_offset = end;
+    }
+    Ok((paragraph.text.clone(), paragraph.runs.clone()))
 }
 
-fn make_collaboration_seed(text: &str) -> Result<Vec<u8>, StoreError> {
+fn collaboration_run_props_are_supported(props: &wordcraft_doc::CharProps) -> bool {
+    let supported_underline =
+        props.underline.is_none_or(|underline| matches!(underline, wordcraft_doc::props::Underline::None | wordcraft_doc::props::Underline::Single));
+    if !supported_underline {
+        return false;
+    }
+    let mut remaining = props.clone();
+    remaining.bold = None;
+    remaining.italic = None;
+    remaining.underline = None;
+    remaining.is_empty()
+}
+
+fn collaboration_attrs(props: &wordcraft_doc::CharProps) -> Attrs {
+    let mut attributes = Attrs::new();
+    if let Some(value) = props.bold {
+        attributes.insert("wc.bold".into(), value.into());
+    }
+    if let Some(value) = props.italic {
+        attributes.insert("wc.italic".into(), value.into());
+    }
+    if let Some(value) = props.underline {
+        attributes.insert("wc.underline".into(), (value == wordcraft_doc::props::Underline::Single).into());
+    }
+    attributes
+}
+
+fn make_collaboration_seed(document: &wordcraft_doc::Document) -> Result<Vec<u8>, StoreError> {
+    let (text, runs) = collaboration_seed_content(document)?;
     let document = Doc::new();
     let shared_text = document.get_or_insert_text(COLLAB_TEXT_ROOT);
-    if !text.is_empty() {
-        shared_text.push(&mut document.transact_mut(), text);
+    let mut transaction = document.transact_mut();
+    let mut byte_offset = 0usize;
+    let mut text_index = 0u32;
+    for run in runs {
+        let end = byte_offset
+            .checked_add(run.len)
+            .ok_or_else(|| StoreError::UnsupportedCollaborationDocument("run offsets exceed the body paragraph size".into()))?;
+        let chunk = text
+            .get(byte_offset..end)
+            .ok_or_else(|| StoreError::UnsupportedCollaborationDocument("run boundaries must align with UTF-8 character boundaries".into()))?;
+        if !chunk.is_empty() {
+            shared_text.insert_with_attributes(&mut transaction, text_index, chunk, collaboration_attrs(&run.props));
+            let byte_len = u32::try_from(chunk.len())
+                .map_err(|_| StoreError::UnsupportedCollaborationDocument("the body paragraph exceeds the Yrs text index range".into()))?;
+            text_index = text_index
+                .checked_add(byte_len)
+                .ok_or_else(|| StoreError::UnsupportedCollaborationDocument("the body paragraph exceeds the Yrs text index range".into()))?;
+        }
+        byte_offset = end;
     }
+    drop(transaction);
     let update = document.transact().encode_state_as_update_v1(&StateVector::default());
     Ok(update)
 }
@@ -1035,6 +1112,99 @@ fn make_collaboration_seed(text: &str) -> Result<Vec<u8>, StoreError> {
 fn unsupported_collaboration_char(character: char) -> bool {
     use wordcraft_doc::para::OBJ;
     character.is_control() || matches!(character, OBJ | '\u{2028}' | '\u{2029}')
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollaborationUpdateScanEvent {
+    GarbageCollectedBlock,
+    SkipBlock,
+    Origin,
+    RootParent,
+    NestedParent,
+    ParentSub,
+    FormatMarker,
+}
+
+/// Yrs 0.28 keeps decoded Update blocks private, while TextRef::diff intentionally omits format
+/// markers that do not cover visible text. Scan the public v1 decoder framing and delegate payload
+/// decoding to Yrs so every Format item is checked, including markers at the current text end.
+fn validate_collaboration_update_attributes(bytes: &[u8]) -> Result<(), String> {
+    let scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_collaboration_update_v1(bytes, |_| {})));
+    match scan {
+        Ok(result) => result,
+        Err(_) => Err("Yrs update failed guarded attribute validation".into()),
+    }
+}
+
+fn scan_collaboration_update_v1<F>(bytes: &[u8], mut event: F) -> Result<(), String>
+where
+    F: FnMut(CollaborationUpdateScanEvent),
+{
+    // Run Yrs' own structural decoder before mirroring its block framing below. This keeps the
+    // scanner on the exact v1 grammar and rejects malformed payloads before our inspection pass.
+    let _ = Update::decode_v1(bytes).map_err(|error| format!("invalid Yrs v1 update: {error}"))?;
+    let mut decoder = DecoderV1::from(bytes);
+    let client_count = decoder.read_var::<u32>().map_err(|error| error.to_string())?;
+
+    for _ in 0..client_count {
+        let block_count = decoder.read_var::<u32>().map_err(|error| error.to_string())?;
+        let _client = decoder.read_client().map_err(|error| error.to_string())?;
+        let _first_clock = decoder.read_var::<u32>().map_err(|error| error.to_string())?;
+
+        for _ in 0..block_count {
+            let info = decoder.read_info().map_err(|error| error.to_string())?;
+            if info == BLOCK_SKIP_REF_NUMBER {
+                let _skip_len = decoder.read_var::<u32>().map_err(|error| error.to_string())?;
+                event(CollaborationUpdateScanEvent::SkipBlock);
+                continue;
+            }
+            if info == BLOCK_GC_REF_NUMBER {
+                let _gc_len = decoder.read_len().map_err(|error| error.to_string())?;
+                event(CollaborationUpdateScanEvent::GarbageCollectedBlock);
+                continue;
+            }
+
+            let has_origin = info & (HAS_ORIGIN | HAS_RIGHT_ORIGIN) != 0;
+            if info & HAS_ORIGIN != 0 {
+                let _origin = decoder.read_left_id().map_err(|error| error.to_string())?;
+                event(CollaborationUpdateScanEvent::Origin);
+            }
+            if info & HAS_RIGHT_ORIGIN != 0 {
+                let _right_origin = decoder.read_right_id().map_err(|error| error.to_string())?;
+                event(CollaborationUpdateScanEvent::Origin);
+            }
+
+            if !has_origin {
+                if decoder.read_parent_info().map_err(|error| error.to_string())? {
+                    let _root_name = decoder.read_string().map_err(|error| error.to_string())?;
+                    event(CollaborationUpdateScanEvent::RootParent);
+                } else {
+                    let _parent_id = decoder.read_left_id().map_err(|error| error.to_string())?;
+                    event(CollaborationUpdateScanEvent::NestedParent);
+                }
+                if info & HAS_PARENT_SUB != 0 {
+                    let _parent_key = decoder.read_string().map_err(|error| error.to_string())?;
+                    event(CollaborationUpdateScanEvent::ParentSub);
+                }
+            }
+
+            if let ItemContent::Format(key, value) = ItemContent::decode(&mut decoder, info).map_err(|error| error.to_string())? {
+                event(CollaborationUpdateScanEvent::FormatMarker);
+                if !matches!(key.as_ref(), "wc.bold" | "wc.italic" | "wc.underline") {
+                    return Err(format!("unsupported collaboration attribute {key}"));
+                }
+                if !matches!(value.as_ref(), Any::Bool(_) | Any::Null) {
+                    return Err(format!("collaboration attribute {key} must be boolean or null"));
+                }
+            }
+        }
+    }
+
+    let _delete_set = IdSet::decode(&mut decoder).map_err(|error| error.to_string())?;
+    if !decoder.read_to_end().map_err(|error| error.to_string())?.is_empty() {
+        return Err("Yrs v1 update contains trailing bytes".into());
+    }
+    Ok(())
 }
 
 fn rebuild_collaboration_document(seed_update: &[u8], updates: &[StoredCollaborationUpdate], incoming_update: bool) -> Result<Doc, StoreError> {
@@ -1050,6 +1220,9 @@ fn rebuild_collaboration_document(seed_update: &[u8], updates: &[StoredCollabora
 
 fn apply_collaboration_update(document: &Doc, bytes: &[u8], incoming_update: bool) -> Result<(), StoreError> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !incoming_update {
+            validate_collaboration_update_attributes(bytes)?;
+        }
         let update = Update::decode_v1(bytes).map_err(|error| error.to_string())?;
         document.transact_mut().apply_update(update).map_err(|error| error.to_string())
     }));
@@ -1061,45 +1234,66 @@ fn apply_collaboration_update(document: &Doc, bytes: &[u8], incoming_update: boo
 }
 
 fn validate_collaboration_state(document: &Doc, incoming_update: bool) -> Result<(), StoreError> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let transaction = document.transact();
-        let mut root = None;
-        for (name, value) in transaction.root_refs() {
-            match (name, value) {
-                (COLLAB_TEXT_ROOT, Out::YText(text)) if root.is_none() => root = Some(text),
-                _ => return Err("only the body:main text root is supported".to_string()),
-            }
-        }
-        let Some(text) = root else {
-            return Err("the body:main text root is missing".to_string());
-        };
-        for chunk in text.diff(&transaction, |_| ()) {
-            if chunk.attributes.is_some() || !matches!(chunk.insert, Out::Any(Any::String(_))) {
-                return Err("only unformatted plain text inserts are supported".to_string());
-            }
-        }
-        let value = text.get_string(&transaction);
-        if value.len() > MAX_COLLAB_TEXT_BYTES {
-            return Err("the body:main text exceeds the collaboration size limit".to_string());
-        }
-        if value.chars().any(unsupported_collaboration_char) {
-            return Err("control characters, inline objects, and paragraph or section breaks are not supported".to_string());
-        }
-        Ok(())
-    }));
-    let result = match result {
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| collaboration_content(document).map(|_| ()))) {
         Ok(result) => result,
-        Err(_) => Err("Yrs state failed guarded plain-text validation".to_string()),
+        Err(_) => Err("Yrs state failed guarded collaboration validation".to_string()),
     };
     result.map_err(|error| if incoming_update { StoreError::InvalidCollaborationUpdate(error) } else { StoreError::InvalidCollaborationState(error) })
 }
 
-fn collaboration_text(document: &Doc) -> Result<String, StoreError> {
+fn collaboration_content(document: &Doc) -> Result<(String, Vec<wordcraft_doc::Run>), String> {
     let transaction = document.transact();
-    let Some((_, Out::YText(text))) = transaction.root_refs().next() else {
-        return Err(StoreError::InvalidCollaborationState("the body:main text root is missing".into()));
+    let mut root = None;
+    for (name, value) in transaction.root_refs() {
+        match (name, value) {
+            (COLLAB_TEXT_ROOT, Out::YText(text)) if root.is_none() => root = Some(text),
+            _ => return Err("only the body:main text root is supported".into()),
+        }
+    }
+    let Some(text) = root else {
+        return Err("the body:main text root is missing".into());
     };
-    Ok(text.get_string(&transaction))
+    let mut value = String::new();
+    let mut runs = Vec::new();
+    for chunk in text.diff(&transaction, |_| ()) {
+        let props = collaboration_char_props(chunk.attributes.as_deref())?;
+        let inserted = match chunk.insert {
+            Out::Any(Any::String(inserted)) => inserted,
+            _ => return Err("only string inserts with supported character properties are allowed".into()),
+        };
+        if value.len().saturating_add(inserted.len()) > MAX_COLLAB_TEXT_BYTES {
+            return Err("the body:main text exceeds the collaboration size limit".into());
+        }
+        value.push_str(&inserted);
+        if !inserted.is_empty() {
+            runs.push(wordcraft_doc::Run { len: inserted.len(), props });
+        }
+    }
+    if value.chars().any(unsupported_collaboration_char) {
+        return Err("control characters, inline objects, and paragraph or section breaks are not supported".into());
+    }
+    Ok((value, runs))
+}
+
+fn collaboration_char_props(attributes: Option<&Attrs>) -> Result<wordcraft_doc::CharProps, String> {
+    let mut props = wordcraft_doc::CharProps::default();
+    let Some(attributes) = attributes else {
+        return Ok(props);
+    };
+    for (key, value) in attributes {
+        let Any::Bool(value) = value else {
+            return Err(format!("collaboration attribute {key} must have a boolean value"));
+        };
+        match key.as_ref() {
+            "wc.bold" => props.bold = Some(*value),
+            "wc.italic" => props.italic = Some(*value),
+            "wc.underline" => {
+                props.underline = Some(if *value { wordcraft_doc::props::Underline::Single } else { wordcraft_doc::props::Underline::None });
+            }
+            _ => return Err(format!("unsupported collaboration attribute {key}")),
+        }
+    }
+    Ok(props)
 }
 
 fn validate_title(title: &str) -> Result<String, StoreError> {
@@ -1155,10 +1349,11 @@ mod tests {
     use super::{Store, StoreError};
     use futures_util::{SinkExt, Stream, StreamExt};
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
-    use wordcraft_doc::{Document, StoryRef};
+    use wordcraft_doc::{CharProps, Document, Paragraph, Run, StoryRef, para_block, props::Underline};
+    use yrs::types::Attrs;
     use yrs::types::text::TextRef;
     use yrs::updates::decoder::Decode;
-    use yrs::{Doc, GetString, Text, Transact, Update};
+    use yrs::{Any, ClientID, Doc, GetString, Map, OffsetKind, Options, ReadTxn, StateVector, Text, Transact, Update};
 
     fn test_path(label: &str) -> PathBuf {
         let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
@@ -1267,7 +1462,13 @@ mod tests {
     }
 
     fn collaboration_client(seed: &[u8], client_id: u64) -> (Doc, TextRef) {
-        let doc = Doc::with_client_id(client_id);
+        collaboration_client_with_offset(seed, client_id, OffsetKind::Bytes)
+    }
+
+    fn collaboration_client_with_offset(seed: &[u8], client_id: u64, offset_kind: OffsetKind) -> (Doc, TextRef) {
+        let mut options = Options::with_client_id(ClientID::new(client_id));
+        options.offset_kind = offset_kind;
+        let doc = Doc::with_options(options);
         let text = doc.get_or_insert_text(super::COLLAB_TEXT_ROOT);
         let update = Update::decode_v1(seed).expect("seed update decodes");
         doc.transact_mut().apply_update(update).expect("seed update applies");
@@ -1281,9 +1482,301 @@ mod tests {
         transaction.encode_update_v1()
     }
 
+    fn client_insert_with_attrs(seed: &[u8], client_id: u64, insertion: &str, attrs: Attrs) -> Vec<u8> {
+        let (doc, text) = collaboration_client(seed, client_id);
+        let mut transaction = doc.transact_mut();
+        text.insert_with_attributes(&mut transaction, 0, insertion, attrs);
+        transaction.encode_update_v1()
+    }
+
+    fn client_format(seed: &[u8], client_id: u64, index: u32, len: u32, attrs: Attrs) -> Vec<u8> {
+        let (doc, text) = collaboration_client(seed, client_id);
+        let mut transaction = doc.transact_mut();
+        text.format(&mut transaction, index, len, attrs);
+        transaction.encode_update_v1()
+    }
+
+    fn text_state_update(value: &str, client_id: u64) -> Vec<u8> {
+        let doc = Doc::with_options(Options::with_client_id(ClientID::new(client_id)));
+        let text = doc.get_or_insert_text(super::COLLAB_TEXT_ROOT);
+        let mut transaction = doc.transact_mut();
+        if !value.is_empty() {
+            text.insert(&mut transaction, 0, value);
+        }
+        transaction.encode_update_v1()
+    }
+
+    fn scan_events(bytes: &[u8]) -> Result<Vec<super::CollaborationUpdateScanEvent>, String> {
+        let mut events = Vec::new();
+        super::scan_collaboration_update_v1(bytes, |event| events.push(event))?;
+        Ok(events)
+    }
+
+    fn one_paragraph(document: &Document) -> &Paragraph {
+        document.body.first().and_then(|block| block.as_para()).expect("document has one body paragraph")
+    }
+
+    fn formatted_seed_document() -> Document {
+        let mut paragraph = Paragraph::with_text("A😀B", CharProps::default());
+        paragraph.runs = vec![
+            Run { len: 1, props: CharProps { bold: Some(true), ..CharProps::default() } },
+            Run { len: 4, props: CharProps { italic: Some(true), underline: Some(Underline::Single), ..CharProps::default() } },
+            Run { len: 1, props: CharProps { bold: Some(false), italic: Some(false), underline: Some(Underline::None), ..CharProps::default() } },
+        ];
+        let mut document = Document::new();
+        document.body = vec![para_block(paragraph)];
+        document
+    }
+
     fn snapshot_text(store: &Store, id: &str) -> String {
         let record = store.get(id).expect("document is stored");
         wordcraft_engine::io::document_from_storage_snapshot(&record.snapshot).expect("stored snapshot decodes").plain_text(StoryRef::Body)
+    }
+
+    #[test]
+    fn formatted_document_seed_preserves_supported_run_properties_in_yrs() {
+        let path = test_path("collab-formatted-seed");
+        let store = Store::open(&path).expect("store opens");
+        let created = store
+            .create("Formatted paragraph", wordcraft_engine::io::storage_snapshot(&formatted_seed_document()).expect("snapshot"))
+            .expect("document creates");
+        let room = super::CollaborationRooms::default().get_or_load(&store, &created.summary.id).expect("formatted document seeds");
+        let (client, text) = collaboration_client(&room.seed_update, 701);
+        let transaction = client.transact();
+        let diffs = text.diff(&transaction, |_| ());
+        assert_eq!(diffs.len(), 3, "UTF-8 run boundaries must map to the correct UTF-16 Yrs offsets");
+        assert_eq!(text.get_string(&transaction), "A😀B");
+
+        let first = diffs.first().expect("first run exists");
+        let first_attrs = first.attributes.as_deref().expect("bold run has attributes");
+        assert_eq!(first_attrs.len(), 1);
+        assert_eq!(first_attrs.get("wc.bold"), Some(&Any::Bool(true)));
+
+        let emoji = diffs.get(1).expect("emoji run exists");
+        let emoji_attrs = emoji.attributes.as_deref().expect("italic underline run has attributes");
+        assert_eq!(emoji_attrs.len(), 2);
+        assert_eq!(emoji_attrs.get("wc.italic"), Some(&Any::Bool(true)));
+        assert_eq!(emoji_attrs.get("wc.underline"), Some(&Any::Bool(true)));
+
+        let last = diffs.get(2).expect("last run exists");
+        let last_attrs = last.attributes.as_deref().expect("explicit false run has attributes");
+        assert_eq!(last_attrs.len(), 3);
+        assert_eq!(last_attrs.get("wc.bold"), Some(&Any::Bool(false)));
+        assert_eq!(last_attrs.get("wc.italic"), Some(&Any::Bool(false)));
+        assert_eq!(last_attrs.get("wc.underline"), Some(&Any::Bool(false)));
+        drop(transaction);
+        drop(room);
+        drop(store);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn remote_format_update_round_trips_into_document_runs() {
+        let path = test_path("collab-formatted-update");
+        let store = Store::open(&path).expect("store opens");
+        let created = store
+            .create("Paragraph", wordcraft_engine::io::storage_snapshot(&Document::from_text("A😀B")).expect("snapshot"))
+            .expect("document creates");
+        let room = super::CollaborationRooms::default().get_or_load(&store, &created.summary.id).expect("collaboration room seeds");
+        let (client, text) = collaboration_client_with_offset(&room.seed_update, 702, OffsetKind::Utf16);
+        let mut transaction = client.transact_mut();
+        text.format(&mut transaction, 1, 2, Attrs::from([("wc.bold".into(), true.into()), ("wc.underline".into(), true.into())]));
+        text.insert_with_attributes(&mut transaction, 3, "!", Attrs::from([("wc.italic".into(), true.into())]));
+        let update = transaction.encode_update_v1();
+        drop(transaction);
+
+        assert!(room.accept_update(&store, &update).expect("formatted update persists"));
+        let record = store.get(&created.summary.id).expect("document snapshot reads");
+        let document = wordcraft_engine::io::document_from_storage_snapshot(&record.snapshot).expect("formatted snapshot decodes");
+        let paragraph = one_paragraph(&document);
+        assert_eq!(paragraph.text, "A😀!B");
+        assert_eq!(paragraph.runs.len(), 4);
+        assert_eq!(paragraph.runs[0], Run { len: 1, props: CharProps::default() });
+        assert_eq!(
+            paragraph.runs[1],
+            Run { len: 4, props: CharProps { bold: Some(true), underline: Some(Underline::Single), ..CharProps::default() } }
+        );
+        assert_eq!(paragraph.runs[2], Run { len: 1, props: CharProps { italic: Some(true), ..CharProps::default() } });
+        assert_eq!(paragraph.runs[3], Run { len: 1, props: CharProps::default() });
+        assert_eq!(record.summary.version, 1, "live formatting does not create REST versions");
+        drop(room);
+        drop(store);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn formatted_collaboration_update_and_snapshot_survive_store_restart() {
+        let path = test_path("collab-formatted-reopen");
+        let id;
+        {
+            let store = Store::open(&path).expect("store opens");
+            let created = store
+                .create("Paragraph", wordcraft_engine::io::storage_snapshot(&Document::from_text("seed")).expect("snapshot"))
+                .expect("document creates");
+            id = created.summary.id.clone();
+            let room = super::CollaborationRooms::default().get_or_load(&store, &id).expect("room seeds");
+            let update = client_insert_with_attrs(
+                &room.seed_update,
+                703,
+                "X",
+                Attrs::from([("wc.bold".into(), true.into()), ("wc.underline".into(), true.into())]),
+            );
+            assert!(room.accept_update(&store, &update).expect("formatted update persists"));
+        }
+
+        let reopened = Store::open(&path).expect("database reopens");
+        let room = super::CollaborationRooms::default().get_or_load(&reopened, &id).expect("collaboration update log replays");
+        let state = room.full_state().expect("formatted state encodes");
+        let (client, text) = collaboration_client(&state, 704);
+        let transaction = client.transact();
+        let diffs = text.diff(&transaction, |_| ());
+        assert_eq!(text.get_string(&transaction), "Xseed");
+        let attributes = diffs.first().and_then(|diff| diff.attributes.as_deref()).expect("replayed formatted run has attributes");
+        assert_eq!(attributes.get("wc.bold"), Some(&Any::Bool(true)));
+        assert_eq!(attributes.get("wc.underline"), Some(&Any::Bool(true)));
+        drop(transaction);
+
+        let document = wordcraft_engine::io::document_from_storage_snapshot(&reopened.get(&id).expect("snapshot survives restart").snapshot)
+            .expect("snapshot decodes");
+        let paragraph = one_paragraph(&document);
+        assert_eq!(paragraph.text, "Xseed");
+        assert_eq!(
+            paragraph.runs.first(),
+            Some(&Run { len: 1, props: CharProps { bold: Some(true), underline: Some(Underline::Single), ..CharProps::default() } })
+        );
+        assert_eq!(paragraph.runs.get(1), Some(&Run { len: 4, props: CharProps::default() }));
+        drop(room);
+        drop(reopened);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn unknown_or_non_boolean_collaboration_attributes_are_rejected() {
+        let path = test_path("collab-bad-attributes");
+        let store = Store::open(&path).expect("store opens");
+        let created = store
+            .create("Paragraph", wordcraft_engine::io::storage_snapshot(&Document::from_text("seed")).expect("snapshot"))
+            .expect("document creates");
+        let room = super::CollaborationRooms::default().get_or_load(&store, &created.summary.id).expect("room seeds");
+        let unknown = client_insert_with_attrs(&room.seed_update, 705, "X", Attrs::from([("wc.font".into(), true.into())]));
+        assert!(matches!(room.accept_update(&store, &unknown), Err(StoreError::InvalidCollaborationUpdate(_))));
+        let wrong_type = client_insert_with_attrs(&room.seed_update, 706, "Y", Attrs::from([("wc.bold".into(), "yes".into())]));
+        assert!(matches!(room.accept_update(&store, &wrong_type), Err(StoreError::InvalidCollaborationUpdate(_))));
+        assert!(store.load_or_seed_collaboration(&created.summary.id).expect("collaboration state remains valid").updates.is_empty());
+        assert_eq!(snapshot_text(&store, &created.summary.id), "seed");
+        drop(room);
+        drop(store);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_attribute_scanner_accepts_plain_supported_and_null_format_updates() {
+        let seed = text_state_update("seed", 810);
+        let plain = client_insert(&seed, 811, "A");
+        assert!(super::validate_collaboration_update_attributes(&plain).is_ok());
+
+        let empty_seed = text_state_update("", 812);
+        let styled_insert = client_insert_with_attrs(
+            &empty_seed,
+            813,
+            "X",
+            Attrs::from([("wc.bold".into(), true.into()), ("wc.italic".into(), false.into()), ("wc.underline".into(), true.into())]),
+        );
+        assert!(super::validate_collaboration_update_attributes(&styled_insert).is_ok());
+
+        let clear_bold = client_format(&styled_insert, 814, 0, 1, Attrs::from([("wc.bold".into(), Any::Null)]));
+        assert!(super::validate_collaboration_update_attributes(&clear_bold).is_ok());
+    }
+
+    #[test]
+    fn terminal_unknown_zero_length_format_marker_is_rejected_before_storage() {
+        let path = test_path("collab-terminal-unknown-format");
+        let store = Store::open(&path).expect("store opens");
+        let created = store
+            .create("Paragraph", wordcraft_engine::io::storage_snapshot(&Document::from_text("seed")).expect("snapshot"))
+            .expect("document creates");
+        let room = super::CollaborationRooms::default().get_or_load(&store, &created.summary.id).expect("room seeds");
+
+        let (client, text) = collaboration_client(&room.seed_update, 815);
+        let mut transaction = client.transact_mut();
+        text.insert_with_attributes(&mut transaction, 4, "X", Attrs::from([("wc.font".into(), "forbidden".into())]));
+        let insertion = transaction.encode_update_v1();
+        drop(transaction);
+        let mut transaction = client.transact_mut();
+        text.remove_range(&mut transaction, 4, 1);
+        let deletion = transaction.encode_update_v1();
+        drop(transaction);
+        let merged = yrs::merge_updates_v1([&insertion, &deletion]).expect("merged update decodes");
+
+        let (receiver, receiver_text) = collaboration_client(&room.seed_update, 816);
+        receiver.transact_mut().apply_update(Update::decode_v1(&merged).expect("merged update decodes")).expect("merged update applies");
+        let transaction = receiver.transact();
+        assert_eq!(receiver_text.get_string(&transaction), "seed");
+        assert!(
+            receiver_text
+                .diff(&transaction, |_| ())
+                .iter()
+                .all(|chunk| { chunk.attributes.as_deref().and_then(|attributes| attributes.get("wc.font")).is_none() })
+        );
+        drop(transaction);
+
+        assert!(matches!(room.accept_update(&store, &merged), Err(StoreError::InvalidCollaborationUpdate(_))));
+        assert!(store.load_or_seed_collaboration(&created.summary.id).expect("state remains valid").updates.is_empty());
+        drop(room);
+        drop(store);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_attribute_scanner_handles_skip_gc_origin_and_parent_framing() {
+        let seed = text_state_update("seed", 820);
+        let origin_update = client_insert(&seed, 821, "A");
+        assert!(scan_events(&origin_update).expect("origin update scans").contains(&super::CollaborationUpdateScanEvent::Origin));
+
+        let empty_seed = text_state_update("", 822);
+        let root_parent_update = client_insert_with_attrs(&empty_seed, 823, "X", Attrs::from([("wc.bold".into(), true.into())]));
+        assert!(scan_events(&root_parent_update).expect("root parent update scans").contains(&super::CollaborationUpdateScanEvent::RootParent));
+
+        let map_doc = Doc::with_options(Options::with_client_id(ClientID::new(824)));
+        let map = map_doc.get_or_insert_map("not-the-collaboration-root");
+        let mut transaction = map_doc.transact_mut();
+        map.insert(&mut transaction, "entry", "value");
+        let nested_map = map.insert(&mut transaction, "child", yrs::MapPrelim::default());
+        nested_map.insert(&mut transaction, "nested-entry", "nested-value");
+        let map_update = transaction.encode_update_v1();
+        let map_events = scan_events(&map_update).expect("map parent fields scan");
+        assert!(map_events.contains(&super::CollaborationUpdateScanEvent::RootParent));
+        assert!(map_events.contains(&super::CollaborationUpdateScanEvent::NestedParent));
+        assert!(map_events.contains(&super::CollaborationUpdateScanEvent::ParentSub));
+
+        let skip_doc = Doc::with_options(Options::with_client_id(ClientID::new(826)));
+        let skip_text = skip_doc.get_or_insert_text(super::COLLAB_TEXT_ROOT);
+        let mut transaction = skip_doc.transact_mut();
+        skip_text.insert(&mut transaction, 0, "A");
+        let first_clock = transaction.encode_update_v1();
+        drop(transaction);
+        let mut transaction = skip_doc.transact_mut();
+        skip_text.insert(&mut transaction, 1, "B");
+        drop(transaction);
+        let mut transaction = skip_doc.transact_mut();
+        skip_text.insert(&mut transaction, 2, "C");
+        let third_clock = transaction.encode_update_v1();
+        let skip_bytes = yrs::merge_updates_v1([&first_clock, &third_clock]).expect("gapped updates merge");
+        assert!(scan_events(&skip_bytes).expect("skip block scans").contains(&super::CollaborationUpdateScanEvent::SkipBlock));
+
+        let gc_doc = Doc::with_options(Options { client_id: ClientID::new(825), skip_gc: true, ..Options::default() });
+        let gc_map = gc_doc.get_or_insert_map("gc-fixture");
+        {
+            let mut transaction = gc_doc.transact_mut();
+            let gc_text = gc_map.insert(&mut transaction, "text", yrs::types::text::TextPrelim::default());
+            gc_text.insert(&mut transaction, 0, "GC");
+            gc_map.remove(&mut transaction, "text");
+        }
+        gc_doc.transact_mut().gc(None);
+        let gc_update = gc_doc.transact().encode_state_as_update_v1(&StateVector::default());
+        assert!(
+            scan_events(&gc_update).expect("garbage-collection block scans").contains(&super::CollaborationUpdateScanEvent::GarbageCollectedBlock)
+        );
     }
 
     async fn next_client_binary<S>(stream: &mut S) -> Vec<u8>

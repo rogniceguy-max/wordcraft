@@ -19,17 +19,22 @@ server exposes `/api/documents/{id}/collab` as a binary Yrs WebSocket. It reuses
 WordCraft `Session`, command dispatch, document model, and renderer; it does not replace the editor
 with a textarea.
 
-The current adapter accepts exactly one unformatted plain-text paragraph in the body. It rejects
-other blocks, styles, inline objects, section breaks, comments, revisions, sources, track changes,
-document protection, and unsupported control characters. WordCraft positions are UTF-8 byte
-offsets. The browser adapter uses Yrs UTF-16 indexing for stable relative selection anchors and
-converts at the boundary; tests cover Han text, emoji, reversed selections, inserts, deletes, and
-actor-scoped undo/redo. The server stores a SHA-256-deduplicated Yrs update log in SQLite, updates
-the materialized document snapshot in the same transaction, and broadcasts only after commit.
-Replayed exact updates receive an acknowledgment only on the reconnecting socket. Server restarts
-rebuild the live state from the seed and update log.
+The current adapter accepts exactly one body paragraph with plain text and direct bold, italic, and
+single underline formatting on selected text. It rejects other blocks, paragraph formatting,
+pending formatting at the paragraph mark, other character styles, inline objects, section breaks,
+comments, revisions, sources, track changes, document protection, and unsupported control
+characters. Formatting can be seeded from an eligible saved document and is persisted with live
+updates. WordCraft positions are UTF-8 byte offsets. The browser adapter uses Yrs UTF-16 indexing
+for stable relative selection anchors and converts at the boundary; tests cover Han text, emoji,
+reversed selections, inserts, deletes, formatting, and actor-scoped undo/redo. The server stores a
+SHA-256-deduplicated Yrs update log in SQLite, updates the materialized document snapshot in the
+same transaction, and broadcasts only after commit. Before storage, it scans every raw Yrs format
+item, including zero-length markers omitted from visible text diffs; this framing scanner is tied
+to the pinned Yrs 0.28.0 version. Replayed exact updates receive an
+acknowledgment only on the reconnecting socket. Server restarts rebuild the live state from the
+seed and update log.
 
-This is a P3 text-only prototype, not the full collaboration product. Manual reconnect works within
+This is a P3/P4.1 narrow prototype, not the full collaboration product. Manual reconnect works within
 the same tab and retries unacknowledged update bytes. If a browser reload recovers an unacknowledged
 live edit, it keeps an immediate local snapshot and asks the user to make a separate server copy or
 discard it; it does not automatically rejoin that snapshot to the CRDT. Updates that are confirmed
@@ -42,16 +47,19 @@ drafts use a per-page key; a new page context rotates a copied session-storage I
 while a same-tab reload reuses its key. The server takes an OS advisory lock so only one WordCraft
 API router can serve a given canonical database path at a time.
 
-There is no shared presence, cursor broadcast, heartbeat timer, automatic reconnect, rich-text or
-table-cell editing, structural editing, or multi-paragraph collaboration yet. Browser-level
-three-tab localhost smoke has passed for edits in both directions and actor-scoped undo; reopening
-the document after a page reload also showed the durable snapshot-save/restore fence. The browser
-smoke ran on one Windows host and does not verify separate computers, IME behavior, DOCX round-trip,
-Mac mini startup/reboot, or the target performance matrix.
+This P4.1 slice does not provide shared presence, cursor broadcast, heartbeat timer, automatic
+reconnect, table-cell editing, structural editing, or multi-paragraph collaboration. Browser-level
+three-tab localhost smoke has passed for edits in both directions and actor-scoped undo. A separate
+two-tab smoke confirmed that selected bold, italic, and single underline reached both editors and
+the materialized server snapshot; typing inside the styled run preserved those attributes in the
+server snapshot. Reopening the document after a page reload also showed the durable
+snapshot-save/restore fence. These browser checks ran on one Windows host; they do not verify
+separate computers, IME behavior, DOCX round-trip, Mac mini startup/reboot, or the target performance
+matrix.
 
 ## Integration gate
 
-The next gate is to expand the adapter to stable paragraph and table-cell identities, preserve
+The next gate is to expand the adapter to stable paragraph and table-cell identities, broaden
 character and paragraph formatting, support range operations safely, and add presence, cursor and
 selection transport. It also needs automatic reconnect and a safe path to reconcile pending updates
 after reload, update-log compaction, and a history model that can snapshot/restore a collaborative
