@@ -1,8 +1,8 @@
 //! Narrow fixed-structure live text collaboration for the browser editor.
 //!
 //! The adapter shares only a frozen sequence of plain-text body paragraphs. Rich structure and
-//! cursor presence are outside this mode; the ordinary WordCraft `Session` remains the visible
-//! editor model.
+//! cursor sharing is outside this mode; anonymous room presence uses a separate ephemeral socket.
+//! The ordinary WordCraft `Session` remains the visible editor model.
 
 use wordcraft_doc::props::Underline;
 use wordcraft_doc::{Block, CharProps, Document, Path, Pos, Run, StoryRef};
@@ -48,6 +48,12 @@ const ATTR_ITALIC: &str = "wc.italic";
 const ATTR_UNDERLINE: &str = "wc.underline";
 const RECONNECT_INITIAL_DELAY_MS: u64 = 500;
 const RECONNECT_MAX_DELAY_MS: u64 = 30_000;
+#[cfg(any(target_arch = "wasm32", test))]
+const PRESENCE_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
+#[cfg(any(target_arch = "wasm32", test))]
+const PRESENCE_MAX_FRAME_BYTES: usize = 64 * 1024;
+#[cfg(any(target_arch = "wasm32", test))]
+const PRESENCE_MAX_PARTICIPANTS: usize = 256;
 #[cfg(target_arch = "wasm32")]
 const CONNECT_TIMEOUT_MS: u64 = 15_000;
 
@@ -70,6 +76,12 @@ impl ReconnectSchedule {
         self.enabled = true;
         self.attempts = 0;
         self.retry_at_ms = None;
+    }
+
+    fn ensure_started(&mut self) {
+        if !self.enabled {
+            self.start();
+        }
     }
 
     fn pause(&mut self) {
@@ -113,6 +125,113 @@ impl ReconnectSchedule {
 #[cfg(any(target_arch = "wasm32", test))]
 fn is_current_socket_generation(event_generation: u64, current_generation: u64) -> bool {
     event_generation == current_generation
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn is_current_presence_generation(event_generation: u64, current_generation: u64) -> bool {
+    event_generation == current_generation
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PresenceHeartbeatSchedule {
+    next_at_ms: Option<u64>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl PresenceHeartbeatSchedule {
+    fn start(&mut self, now_ms: u64) {
+        self.next_at_ms = Some(now_ms);
+    }
+
+    fn pause(&mut self) {
+        self.next_at_ms = None;
+    }
+
+    /// Returns true once when due. A delayed frame advances from `now`, coalescing missed ticks.
+    fn due(&mut self, now_ms: u64) -> bool {
+        if !self.next_at_ms.is_some_and(|next_at_ms| now_ms >= next_at_ms) {
+            return false;
+        }
+        self.next_at_ms = Some(now_ms.saturating_add(PRESENCE_HEARTBEAT_INTERVAL_MS));
+        true
+    }
+
+    fn wait_ms(&self, now_ms: u64) -> Option<u64> {
+        self.next_at_ms.map(|next_at_ms| next_at_ms.saturating_sub(now_ms))
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresenceParticipant {
+    id: String,
+    name: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresenceRosterMessage {
+    kind: String,
+    participants: Vec<PresenceParticipant>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_presence_roster(message: &str) -> Result<Vec<PresenceParticipant>, String> {
+    if message.len() > PRESENCE_MAX_FRAME_BYTES {
+        return Err("The presence roster exceeded its size limit.".into());
+    }
+    let roster: PresenceRosterMessage = serde_json::from_str(message).map_err(|error| format!("Invalid presence roster: {error}"))?;
+    if roster.kind != "roster" {
+        return Err("The presence server sent an unsupported message.".into());
+    }
+    if roster.participants.len() > PRESENCE_MAX_PARTICIPANTS {
+        return Err("The presence roster contains too many participants.".into());
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for participant in &roster.participants {
+        if participant.id.is_empty()
+            || participant.id.len() > 128
+            || participant.name.is_empty()
+            || participant.name.len() > 128
+            || participant.id.chars().any(char::is_control)
+            || participant.name.chars().any(char::is_control)
+            || !ids.insert(participant.id.as_str())
+        {
+            return Err("The presence roster contains an invalid participant.".into());
+        }
+    }
+    Ok(roster.participants)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn presence_heartbeat_json() -> &'static str {
+    r#"{"kind":"heartbeat"}"#
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PresenceSocketEvent {
+    Open { generation: u64 },
+    Message { generation: u64, text: String },
+    BadMessage { generation: u64 },
+    Closed { generation: u64 },
+    Error { generation: u64 },
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl PresenceSocketEvent {
+    fn generation(&self) -> u64 {
+        match self {
+            PresenceSocketEvent::Open { generation }
+            | PresenceSocketEvent::Message { generation, .. }
+            | PresenceSocketEvent::BadMessage { generation }
+            | PresenceSocketEvent::Closed { generation }
+            | PresenceSocketEvent::Error { generation } => *generation,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -864,6 +983,7 @@ struct BridgeState {
     socket_generation: u64,
     connection_deadline_ms: Option<u64>,
     reconnect: ReconnectSchedule,
+    presence: PresenceState,
     on_open: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>>,
     on_message: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::MessageEvent)>>,
     on_close: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>>,
@@ -873,6 +993,33 @@ struct BridgeState {
     first_state_received: bool,
     epoch_documents: std::collections::BTreeSet<String>,
     status: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+struct PresenceState {
+    phase: PresencePhase,
+    socket: Option<web_sys::WebSocket>,
+    socket_generation: u64,
+    connection_deadline_ms: Option<u64>,
+    reconnect: ReconnectSchedule,
+    heartbeat: PresenceHeartbeatSchedule,
+    on_open: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>>,
+    on_message: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::MessageEvent)>>,
+    on_close: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>>,
+    on_error: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>>,
+    events: std::collections::VecDeque<PresenceSocketEvent>,
+    participants: Vec<PresenceParticipant>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PresencePhase {
+    #[default]
+    Inactive,
+    Connecting,
+    Live,
+    Offline,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -924,6 +1071,7 @@ impl Default for BridgeState {
             socket_generation: 0,
             connection_deadline_ms: None,
             reconnect: ReconnectSchedule::default(),
+            presence: PresenceState::default(),
             on_open: None,
             on_message: None,
             on_close: None,
@@ -934,6 +1082,46 @@ impl Default for BridgeState {
             epoch_documents: std::collections::BTreeSet::new(),
             status: "Live text is not connected.".into(),
         }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl PresenceState {
+    fn close_socket(&mut self) {
+        self.socket_generation = self.socket_generation.wrapping_add(1);
+        if let Some(socket) = self.socket.take() {
+            socket.set_onopen(None);
+            socket.set_onmessage(None);
+            socket.set_onclose(None);
+            socket.set_onerror(None);
+            let _ = socket.close();
+        }
+        self.on_open = None;
+        self.on_message = None;
+        self.on_close = None;
+        self.on_error = None;
+        self.events.clear();
+    }
+
+    fn stop(&mut self) {
+        if self.phase != PresencePhase::Inactive || self.socket.is_some() {
+            self.close_socket();
+        } else {
+            self.events.clear();
+        }
+        self.phase = PresencePhase::Inactive;
+        self.connection_deadline_ms = None;
+        self.reconnect.pause();
+        self.heartbeat.pause();
+        self.participants.clear();
+    }
+
+    fn failed(&mut self) {
+        self.close_socket();
+        self.phase = PresencePhase::Offline;
+        self.connection_deadline_ms = None;
+        self.heartbeat.pause();
+        self.participants.clear();
     }
 }
 
@@ -985,6 +1173,7 @@ impl CollaborationBridge {
             let Ok(mut state) = self.inner.try_borrow_mut() else { return };
             if state.document_id.is_some() && state.document_id.as_deref() != active_document_id {
                 state.close_socket();
+                state.presence.stop();
                 state.reconnect.pause();
                 state.connection_deadline_ms = None;
                 state.phase = ConnectionPhase::Inactive;
@@ -1051,6 +1240,7 @@ impl CollaborationBridge {
             ctx.request_repaint();
         }
         self.maybe_auto_reconnect(active_document_id, ctx);
+        self.update_presence(active_document_id, ctx);
     }
 
     fn maybe_auto_reconnect(&self, active_document_id: Option<&str>, ctx: &egui::Context) {
@@ -1088,8 +1278,219 @@ impl CollaborationBridge {
         }
     }
 
+    fn update_presence(&self, active_document_id: Option<&str>, ctx: &egui::Context) {
+        let events = {
+            let Ok(mut state) = self.inner.try_borrow_mut() else { return };
+            if state.phase != ConnectionPhase::Live || state.document_id.as_deref() != active_document_id {
+                state.presence.stop();
+                return;
+            }
+            let now_ms = monotonic_now_ms();
+            if state.presence.phase == PresencePhase::Connecting && state.presence.connection_deadline_ms.is_some_and(|deadline| now_ms >= deadline) {
+                state.presence.failed();
+            }
+            state.presence.events.drain(..).collect::<Vec<_>>()
+        };
+
+        for event in events {
+            let Ok(mut state) = self.inner.try_borrow_mut() else { return };
+            if !is_current_presence_generation(event.generation(), state.presence.socket_generation) {
+                continue;
+            }
+            match event {
+                PresenceSocketEvent::Open { .. } => {
+                    if state.phase == ConnectionPhase::Live && state.presence.phase == PresencePhase::Connecting {
+                        let now_ms = monotonic_now_ms();
+                        state.presence.phase = PresencePhase::Live;
+                        state.presence.connection_deadline_ms = None;
+                        state.presence.reconnect.connected();
+                        state.presence.heartbeat.start(now_ms);
+                    }
+                }
+                PresenceSocketEvent::Message { text, .. } => {
+                    if state.phase == ConnectionPhase::Live && state.presence.phase == PresencePhase::Live {
+                        match parse_presence_roster(&text) {
+                            Ok(participants) => state.presence.participants = participants,
+                            Err(_) => state.presence.failed(),
+                        }
+                    }
+                }
+                PresenceSocketEvent::BadMessage { .. } | PresenceSocketEvent::Closed { .. } | PresenceSocketEvent::Error { .. } => {
+                    if state.phase == ConnectionPhase::Live && state.presence.phase != PresencePhase::Inactive {
+                        state.presence.failed();
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
+
+        let (open_document, wait_ms) = {
+            let Ok(mut state) = self.inner.try_borrow_mut() else { return };
+            if state.phase != ConnectionPhase::Live || state.document_id.as_deref() != active_document_id {
+                state.presence.stop();
+                return;
+            }
+            let now_ms = monotonic_now_ms();
+            let mut open_document = None;
+            let mut wait_ms = None;
+            match state.presence.phase {
+                PresencePhase::Inactive => open_document = state.document_id.clone(),
+                PresencePhase::Connecting => {
+                    wait_ms = state.presence.connection_deadline_ms.map(|deadline| deadline.saturating_sub(now_ms));
+                }
+                PresencePhase::Offline => match state.presence.reconnect.tick(now_ms) {
+                    ReconnectDecision::Disabled => {}
+                    ReconnectDecision::Wait(wait) => wait_ms = Some(wait),
+                    ReconnectDecision::RetryNow => open_document = state.document_id.clone(),
+                },
+                PresencePhase::Live => {
+                    if state.presence.heartbeat.due(now_ms) {
+                        let heartbeat_result = state
+                            .presence
+                            .socket
+                            .as_ref()
+                            .filter(|socket| socket.ready_state() == web_sys::WebSocket::OPEN)
+                            .ok_or_else(|| "The presence socket is not open.".to_string())
+                            .and_then(|socket| socket.send_with_str(presence_heartbeat_json()).map_err(browser_error));
+                        if heartbeat_result.is_err() {
+                            state.presence.failed();
+                            match state.presence.reconnect.tick(now_ms) {
+                                ReconnectDecision::Wait(wait) => wait_ms = Some(wait),
+                                ReconnectDecision::RetryNow => open_document = state.document_id.clone(),
+                                ReconnectDecision::Disabled => {}
+                            }
+                        }
+                    }
+                    if state.presence.phase == PresencePhase::Live {
+                        wait_ms = state.presence.heartbeat.wait_ms(now_ms);
+                    }
+                }
+            }
+            (open_document, wait_ms)
+        };
+
+        if let Some(document_id) = open_document {
+            self.open_presence_socket(&document_id, ctx);
+        }
+        if let Some(wait_ms) = wait_ms {
+            ctx.request_repaint_after(std::time::Duration::from_millis(wait_ms.max(1)));
+        }
+    }
+
+    fn open_presence_socket(&self, document_id: &str, ctx: &egui::Context) {
+        use wasm_bindgen::JsCast as _;
+
+        let generation = {
+            let Ok(mut state) = self.inner.try_borrow_mut() else { return };
+            if state.phase != ConnectionPhase::Live || state.document_id.as_deref() != Some(document_id) {
+                return;
+            }
+            if matches!(state.presence.phase, PresencePhase::Connecting | PresencePhase::Live) {
+                return;
+            }
+            if state.presence.phase == PresencePhase::Inactive {
+                state.presence.reconnect.ensure_started();
+            }
+            state.presence.close_socket();
+            state.presence.phase = PresencePhase::Connecting;
+            state.presence.connection_deadline_ms = Some(monotonic_now_ms().saturating_add(CONNECT_TIMEOUT_MS));
+            state.presence.socket_generation
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(CONNECT_TIMEOUT_MS));
+
+        let fail = |bridge: &CollaborationBridge| {
+            if let Ok(mut state) = bridge.inner.try_borrow_mut()
+                && state.presence.socket_generation == generation
+            {
+                state.presence.failed();
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(RECONNECT_INITIAL_DELAY_MS));
+        };
+        let Some(window) = web_sys::window() else {
+            fail(self);
+            return;
+        };
+        let location = window.location();
+        let Ok(protocol) = location.protocol() else {
+            fail(self);
+            return;
+        };
+        let Ok(host) = location.host() else {
+            fail(self);
+            return;
+        };
+        let scheme = match protocol.as_str() {
+            "https:" => "wss",
+            "http:" => "ws",
+            _ => {
+                fail(self);
+                return;
+            }
+        };
+        let Some(encoded_id) = js_sys::encode_uri_component(document_id).as_string() else {
+            fail(self);
+            return;
+        };
+        let url = format!("{scheme}://{host}/api/documents/{encoded_id}/presence");
+        let socket = match web_sys::WebSocket::new(&url) {
+            Ok(socket) => socket,
+            Err(_) => {
+                fail(self);
+                return;
+            }
+        };
+
+        let weak = std::rc::Rc::downgrade(&self.inner);
+        let repaint = ctx.clone();
+        let on_open = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            enqueue_presence_event(&weak, PresenceSocketEvent::Open { generation }, &repaint);
+        });
+        let weak = std::rc::Rc::downgrade(&self.inner);
+        let repaint = ctx.clone();
+        let on_message = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+            let data = event.data();
+            if let Some(text) = data.as_string() {
+                enqueue_presence_event(&weak, PresenceSocketEvent::Message { generation, text }, &repaint);
+            } else {
+                enqueue_presence_event(&weak, PresenceSocketEvent::BadMessage { generation }, &repaint);
+            }
+        });
+        let weak = std::rc::Rc::downgrade(&self.inner);
+        let repaint = ctx.clone();
+        let on_close = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            enqueue_presence_event(&weak, PresenceSocketEvent::Closed { generation }, &repaint);
+        });
+        let weak = std::rc::Rc::downgrade(&self.inner);
+        let repaint = ctx.clone();
+        let on_error = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            enqueue_presence_event(&weak, PresenceSocketEvent::Error { generation }, &repaint);
+        });
+        socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+        socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+        socket.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+
+        if let Ok(mut state) = self.inner.try_borrow_mut() {
+            if state.phase == ConnectionPhase::Live
+                && state.document_id.as_deref() == Some(document_id)
+                && state.presence.socket_generation == generation
+                && state.presence.phase == PresencePhase::Connecting
+            {
+                state.presence.socket = Some(socket);
+                state.presence.on_open = Some(on_open);
+                state.presence.on_message = Some(on_message);
+                state.presence.on_close = Some(on_close);
+                state.presence.on_error = Some(on_error);
+            } else {
+                let _ = socket.close();
+            }
+        } else {
+            let _ = socket.close();
+        }
+    }
+
     pub fn ui(&self, session: &mut Session, active_document_id: Option<String>, join_readiness: Result<(), String>, ctx: &egui::Context) {
-        let (phase, status, current_id, snapshot_locked, auto_reconnect) = self
+        let (phase, status, current_id, snapshot_locked, auto_reconnect, presence_phase, participants) = self
             .inner
             .try_borrow()
             .map(|state| {
@@ -1099,9 +1500,11 @@ impl CollaborationBridge {
                     state.document_id.clone(),
                     active_document_id.as_deref().is_some_and(|id| state.epoch_documents.contains(id)),
                     state.reconnect.enabled,
+                    state.presence.phase,
+                    state.presence.participants.clone(),
                 )
             })
-            .unwrap_or((ConnectionPhase::Faulted, "Live text state is busy.".into(), None, false, false));
+            .unwrap_or((ConnectionPhase::Faulted, "Live text state is busy.".into(), None, false, false, PresencePhase::Inactive, Vec::new()));
 
         let mut join = false;
         let mut reconnect = false;
@@ -1113,9 +1516,28 @@ impl CollaborationBridge {
             .collapsible(false)
             .show(ctx, |ui| {
                 ui.label("Scope: 1–256 fixed body paragraphs with plain text, bold, italic, and single underline on selected text. Editing and formatting stay inside one paragraph; paragraph structure is fixed.");
-                ui.small("Text and selected-format changes are durably saved as live updates. Version history does not include live edits; restore is disabled. No shared cursors or presence are provided.");
+                ui.small("Text and selected-format changes are durably saved as live updates. Version history does not include live edits; restore is disabled.");
                 ui.separator();
                 ui.label(status);
+                match presence_phase {
+                    PresencePhase::Inactive => {
+                        ui.small("Anonymous presence is paused until the live text connection is active.");
+                    }
+                    PresencePhase::Connecting => {
+                        ui.small("Connecting anonymous presence…");
+                    }
+                    PresencePhase::Live if participants.is_empty() => {
+                        ui.small("Anonymous presence is connected; waiting for the participant list…");
+                    }
+                    PresencePhase::Live => {
+                        let names = participants.iter().map(|participant| participant.name.as_str()).collect::<Vec<_>>().join(", ");
+                        ui.label(format!("Anonymous participants ({}): {names}", participants.len()));
+                        ui.small("These temporary names do not verify anyone’s identity.");
+                    }
+                    PresencePhase::Offline => {
+                        ui.small("Anonymous presence is reconnecting; the participant list is temporarily unavailable.");
+                    }
+                }
                 if snapshot_locked && phase == ConnectionPhase::Inactive {
                     ui.colored_label(egui::Color32::YELLOW, "Live text edits are not included in version history. Snapshot save and restore are unavailable for this document.");
                 }
@@ -1202,9 +1624,11 @@ impl CollaborationBridge {
         session.reset_history();
         if let Ok(mut state) = self.inner.try_borrow_mut() {
             if state.phase == ConnectionPhase::Inactive || state.document_id.as_deref() != Some(document_id.as_str()) {
+                state.presence.stop();
                 state.adapter = Some(adapter);
                 state.first_state_received = false;
             }
+            state.presence.reconnect.start();
             state.reconnect.start();
             state.connection_deadline_ms = None;
             state.document_id = Some(document_id.clone());
@@ -1223,6 +1647,8 @@ impl CollaborationBridge {
                 return;
             }
             state.close_socket();
+            state.presence.stop();
+            state.presence.reconnect.start();
             state.reconnect.start();
             state.connection_deadline_ms = None;
             state.first_state_received = false;
@@ -1343,6 +1769,7 @@ impl CollaborationBridge {
     fn disconnect(&self, session: &mut Session) {
         if let Ok(mut state) = self.inner.try_borrow_mut() {
             state.close_socket();
+            state.presence.stop();
             state.reconnect.pause();
             state.connection_deadline_ms = None;
             state.phase = ConnectionPhase::Offline;
@@ -1555,8 +1982,7 @@ impl BridgeState {
             self.phase = ConnectionPhase::Live;
             self.connection_deadline_ms = None;
             self.reconnect.connected();
-            self.status =
-                "Live. Text changes are persisted by the server; version history excludes these edits. No cursor presence is shared.".into();
+            self.status = "Live. Text changes are persisted by the server; version history excludes these edits.".into();
             if let Some(id) = self.document_id.clone() {
                 self.epoch_documents.insert(id);
             }
@@ -1571,8 +1997,7 @@ impl BridgeState {
                 }
             } else if result.local_state_acknowledged {
                 session.dirty = false;
-                self.status =
-                    "Live. The server confirmed all pending text and formatting updates. Version history excludes these edits. No cursor presence is shared.".into();
+                self.status = "Live. The server confirmed all pending text and formatting updates. Version history excludes these edits.".into();
             } else if let Some(update) = result.catch_up {
                 session.dirty = true;
                 if let Err(error) = self.send_update(&update) {
@@ -1581,9 +2006,7 @@ impl BridgeState {
                 }
             } else {
                 session.dirty = false;
-                self.status =
-                    "Live. The server confirmed all text and formatting updates. Version history excludes these edits. No cursor presence is shared."
-                        .into();
+                self.status = "Live. The server confirmed all text and formatting updates. Version history excludes these edits.".into();
             }
         } else {
             let acknowledged = self.pending_updates.iter().position(|pending| pending.as_slice() == bytes);
@@ -1593,14 +2016,12 @@ impl BridgeState {
             }
             if self.pending_updates.is_empty() {
                 session.dirty = false;
-                self.status =
-                    "Live. The server confirmed all text and formatting updates. Version history excludes these edits. No cursor presence is shared."
-                        .into();
+                self.status = "Live. The server confirmed all text and formatting updates. Version history excludes these edits.".into();
             } else {
                 self.status = format!("Syncing live text… {} update(s) await server confirmation.", self.pending_updates.len());
             }
             if changed && self.pending_updates.is_empty() {
-                self.status = "Live. Remote text or formatting was applied to the existing editor; all updates are durably stored. Version history excludes live edits. No cursor presence is shared.".into();
+                self.status = "Live. Remote text or formatting was applied to the existing editor; all updates are durably stored. Version history excludes live edits.".into();
             }
         }
         Ok(())
@@ -1656,6 +2077,16 @@ fn enqueue_socket_event(state: &std::rc::Weak<std::cell::RefCell<BridgeState>>, 
 }
 
 #[cfg(target_arch = "wasm32")]
+fn enqueue_presence_event(state: &std::rc::Weak<std::cell::RefCell<BridgeState>>, event: PresenceSocketEvent, ctx: &egui::Context) {
+    if let Some(state) = state.upgrade()
+        && let Ok(mut state) = state.try_borrow_mut()
+    {
+        state.presence.events.push_back(event);
+        ctx.request_repaint();
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 fn monotonic_now_ms() -> u64 {
     web_sys::window().and_then(|window| window.performance()).map(|performance| performance.now()).unwrap_or_else(js_sys::Date::now).max(0.0) as u64
 }
@@ -1668,9 +2099,10 @@ fn browser_error(error: wasm_bindgen::JsValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTR_BOLD, Any, Attrs, LiveText, MAX_SHARED_PARAGRAPHS, MAX_SHARED_TEXT_BYTES, ReconnectDecision, ReconnectSchedule,
-        apply_local_text_command, is_current_socket_generation, one_splice, resolve_sticky, selection_format_value, shared_text_root, supported_body,
-        supported_body_text, validate_shared_paragraphs,
+        ATTR_BOLD, Any, Attrs, LiveText, MAX_SHARED_PARAGRAPHS, MAX_SHARED_TEXT_BYTES, PRESENCE_HEARTBEAT_INTERVAL_MS, PresenceHeartbeatSchedule,
+        PresenceSocketEvent, ReconnectDecision, ReconnectSchedule, apply_local_text_command, is_current_presence_generation,
+        is_current_socket_generation, one_splice, parse_presence_roster, presence_heartbeat_json, resolve_sticky, selection_format_value,
+        shared_text_root, supported_body, supported_body_text, validate_shared_paragraphs,
     };
     use serde_json::json;
     use wordcraft_doc::{Block, CharProps, Document, Pos};
@@ -1698,9 +2130,69 @@ mod tests {
     }
 
     #[test]
+    fn presence_retry_schedule_restarts_after_text_disconnect_pauses_it() {
+        let mut schedule = ReconnectSchedule::default();
+        schedule.start();
+        schedule.pause();
+        assert_eq!(schedule.tick(10_000), ReconnectDecision::Disabled);
+
+        // Reopening the presence socket from Inactive calls ensure_started after the durable
+        // text socket returns to Live.
+        schedule.ensure_started();
+        assert_eq!(schedule.tick(10_000), ReconnectDecision::Wait(500));
+        assert_eq!(schedule.tick(10_500), ReconnectDecision::RetryNow);
+    }
+
+    #[test]
     fn events_from_a_closed_socket_generation_are_ignored() {
         assert!(is_current_socket_generation(8, 8));
         assert!(!is_current_socket_generation(7, 8));
+    }
+
+    #[test]
+    fn presence_roster_parser_accepts_only_the_roster_contract() {
+        let participants = parse_presence_roster(r#"{"kind":"roster","participants":[{"id":"a1","name":"Guest 1"},{"id":"b2","name":"访客二"}]}"#)
+            .expect("valid anonymous roster parses");
+        assert_eq!(participants.len(), 2);
+        assert_eq!(participants[0].id, "a1");
+        assert_eq!(participants[0].name, "Guest 1");
+        assert_eq!(participants[1].name, "访客二");
+
+        assert!(parse_presence_roster(r#"{"kind":"heartbeat","participants":[]}"#).is_err());
+        assert!(parse_presence_roster(r#"{"kind":"roster","participants":[],"extra":true}"#).is_err());
+        assert!(parse_presence_roster(r#"{"kind":"roster","participants":[{"id":"a1"}]}"#).is_err());
+        assert!(parse_presence_roster(r#"{"kind":"roster","participants":[{"id":"a1","name":"Guest"},{"id":"a1","name":"Guest 2"}]}"#).is_err());
+    }
+
+    #[test]
+    fn presence_heartbeat_schedule_sends_immediately_and_coalesces_delayed_ticks() {
+        let mut schedule = PresenceHeartbeatSchedule::default();
+        assert!(!schedule.due(100));
+        schedule.start(100);
+        assert!(schedule.due(100), "the first heartbeat is sent as soon as the socket opens");
+        assert_eq!(schedule.wait_ms(100), Some(PRESENCE_HEARTBEAT_INTERVAL_MS));
+        assert!(!schedule.due(100 + PRESENCE_HEARTBEAT_INTERVAL_MS - 1));
+        assert!(schedule.due(100_000), "a delayed browser frame sends only one heartbeat");
+        assert!(!schedule.due(100_000), "missed ticks are not replayed as a burst");
+        assert_eq!(presence_heartbeat_json(), r#"{"kind":"heartbeat"}"#);
+        schedule.pause();
+        assert!(!schedule.due(200_000));
+    }
+
+    #[test]
+    fn stale_presence_socket_events_are_ignored_by_generation() {
+        let events = [
+            PresenceSocketEvent::Open { generation: 4 },
+            PresenceSocketEvent::Message { generation: 4, text: r#"{"kind":"roster","participants":[]}"#.into() },
+            PresenceSocketEvent::BadMessage { generation: 4 },
+            PresenceSocketEvent::Closed { generation: 4 },
+            PresenceSocketEvent::Error { generation: 4 },
+        ];
+        for event in events {
+            assert_eq!(event.generation(), 4);
+            assert!(is_current_presence_generation(event.generation(), 4));
+            assert!(!is_current_presence_generation(event.generation(), 5));
+        }
     }
 
     #[test]

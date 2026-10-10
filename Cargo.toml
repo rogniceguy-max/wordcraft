@@ -58,7 +58,7 @@ arboard = { version = "3.6", default-features = false }
 # Local document service
 axum = { version = "0.8", features = ["ws"] }
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 tower-http = { version = "0.6", features = ["fs"] }
 uuid = { version = "1", features = ["v4"] }
 yrs = "=0.28.0"

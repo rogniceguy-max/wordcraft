@@ -56,27 +56,38 @@ drafts use a per-page key; a new page context rotates a copied session-storage I
 while a same-tab reload reuses its key. The server takes an OS advisory lock so only one WordCraft
 API router can serve a given canonical database path at a time.
 
-This P4.3 slice does not provide shared presence, cursor broadcast, heartbeat timer, table-cell
-editing, paragraph structure editing, or automatic reload rejoin. Browser-level three-tab localhost
-smoke has passed for edits in both directions and actor-scoped undo. A separate two-tab smoke
-confirmed that selected bold, italic, and single underline reached both editors and the materialized
-server snapshot; typing inside the styled run preserved those attributes in the server snapshot.
-Automatic reconnect backoff and stale-socket filtering have unit coverage, while browser outage and
-recovery remain unverified. Multi-paragraph collaboration is covered by server/client tests but has
-not yet had browser smoke. Reopening the document after a page reload also showed the durable
-snapshot-save/restore fence. These browser checks ran on one Windows host; they do not verify
-separate computers, IME behavior, DOCX round-trip, Mac mini startup/reboot, or the target performance
-matrix.
+P4.3 provided no presence or cursor broadcast. P4.4 adds an independent ephemeral WebSocket at
+`/api/documents/{id}/presence`. It assigns a random session ID and a temporary `Guest N` name,
+broadcasts the current roster, accepts only small JSON heartbeat messages, expires sessions after
+45 seconds without a heartbeat, and sends a refreshed roster on join or leave. Presence is limited
+to existing, non-deleted documents and 128 concurrent participants per document. It does not write
+to the document, version history, Yrs state, or update log. The client opens it only while the
+durable text channel is live, sends a heartbeat every 15 seconds, retries it independently, ignores
+stale socket events, and clears names when the channel stops or fails. These names only distinguish
+temporary sessions; they do not authenticate anyone. Focused server/client tests cover roster
+fanout, heartbeat expiry, capacity and cleanup, invalid messages, storage isolation, heartbeat
+scheduling, generation filtering, and retry restart after the text channel recovers.
+
+P4.4 still has no shared cursor or selection transport, table-cell editing, paragraph structure
+editing, or automatic reload rejoin. Browser-level three-tab localhost smoke has passed for edits
+in both directions and actor-scoped undo. A separate two-tab smoke confirmed that selected bold,
+italic, and single underline reached both editors and the materialized server snapshot; typing
+inside the styled run preserved those attributes in the server snapshot. Automatic reconnect
+backoff and stale-socket filtering have unit coverage, while browser outage and recovery remain
+unverified. Multi-paragraph collaboration and the new presence channel have not yet had browser
+smoke. Reopening the document after a page reload also showed the durable snapshot-save/restore
+fence. The prior browser checks ran on one Windows host; they do not verify separate computers, IME
+behavior, DOCX round-trip, Mac mini startup/reboot, or the target performance matrix.
 
 ## Integration gate
 
-The next gate is to add fixed-topology table-cell text roots, broaden character and paragraph
-formatting, support range operations safely, and add presence, cursor and selection transport. It
-also needs a safe path to reconcile pending updates after reload, update-log compaction, and a history
-model that can snapshot/restore a collaborative
-epoch without letting stale sessions overwrite it. Automated multi-client acceptance should cover
-same-position insertions, delete/insert races, formatting, table cells, IME composition, and server
-restart before broadening the enabled command set.
+The next gate is to add cursor and selection transport with CRDT-relative anchors, then fixed-
+topology table-cell text roots. Broader character and paragraph formatting and safe range operations
+follow only after those mappings are tested. The collaboration path also needs a safe way to
+reconcile pending updates after reload, update-log compaction, and a history model that can
+snapshot/restore an epoch without letting stale sessions overwrite it. Automated multi-client
+acceptance should cover same-position insertions, delete/insert races, formatting, table cells, IME
+composition, and server restart before broadening the enabled command set.
 
 Yrs updates are idempotent and commutative, so transport delivery order need not define the document
 order. Native whole-document undo is reset while live text is active; actor-scoped Yrs undo handles

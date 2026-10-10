@@ -5,12 +5,12 @@
 //! with plain text and selected character styles; it is not a rich-document collaboration adapter.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
@@ -40,11 +40,16 @@ const MAX_COLLAB_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COLLAB_PARAGRAPHS: usize = 256;
 const COLLAB_TEXT_ROOT: &str = "body:main";
 const COLLAB_ROOM_CAPACITY: usize = 256;
+const MAX_PRESENCE_MESSAGE_BYTES: usize = 1024;
+const MAX_PRESENCE_PARTICIPANTS: usize = 128;
+const PRESENCE_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+const PRESENCE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
     collab_rooms: Arc<CollaborationRooms>,
+    presence_rooms: Arc<PresenceRooms>,
     _server_lock: Arc<DatabaseProcessLock>,
 }
 
@@ -56,12 +61,18 @@ pub fn api_router(store: Arc<Store>) -> io::Result<Router> {
         .route("/api/documents", get(list_documents).post(create_document))
         .route("/api/documents/{id}", get(read_document).put(save_document))
         .route("/api/documents/{id}/collab", get(collaborate))
+        .route("/api/documents/{id}/presence", get(presence))
         .route("/api/documents/{id}/versions", get(list_versions))
         .route("/api/documents/{id}/restore-version", post(restore_version))
         .route("/api/documents/{id}/trash", post(trash_document))
         .route("/api/documents/{id}/untrash", post(untrash_document))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-        .with_state(AppState { store, collab_rooms: Arc::new(CollaborationRooms::default()), _server_lock: server_lock }))
+        .with_state(AppState {
+            store,
+            collab_rooms: Arc::new(CollaborationRooms::default()),
+            presence_rooms: Arc::new(PresenceRooms::default()),
+            _server_lock: server_lock,
+        }))
 }
 
 struct DatabaseProcessLock {
@@ -93,6 +104,182 @@ impl DatabaseProcessLock {
 struct CollaborationRooms {
     // Live fanout is process-local; run one server instance for each SQLite database.
     rooms: Mutex<HashMap<String, Weak<CollaborationRoom>>>,
+}
+
+#[derive(Default)]
+struct PresenceRooms {
+    rooms: Mutex<HashMap<String, Arc<PresenceRoom>>>,
+}
+
+struct PresenceRoom {
+    participants: Mutex<BTreeMap<String, PresenceParticipant>>,
+    updates: broadcast::Sender<String>,
+}
+
+struct PresenceParticipant {
+    name: String,
+    last_heartbeat: Instant,
+}
+
+struct PresenceSession {
+    id: String,
+    room: Arc<PresenceRoom>,
+    updates: broadcast::Receiver<String>,
+}
+
+#[derive(Serialize)]
+struct PresenceRoster {
+    kind: &'static str,
+    participants: Vec<PresenceParticipantView>,
+}
+
+#[derive(Serialize)]
+struct PresenceParticipantView {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresenceClientMessage {
+    kind: String,
+}
+
+impl PresenceRoom {
+    fn new() -> Self {
+        let (updates, _) = broadcast::channel(MAX_PRESENCE_PARTICIPANTS * 2);
+        PresenceRoom { participants: Mutex::new(BTreeMap::new()), updates }
+    }
+
+    fn add_at(&self, now: Instant) -> Result<(String, String, String), String> {
+        let mut participants = self.participants.lock().map_err(|_| "presence room lock was poisoned".to_string())?;
+        if participants.len() >= MAX_PRESENCE_PARTICIPANTS {
+            return Err("this document already has the maximum number of presence participants".into());
+        }
+        let name = (1..=MAX_PRESENCE_PARTICIPANTS)
+            .map(|number| format!("Guest {number}"))
+            .find(|candidate| participants.values().all(|participant| participant.name != *candidate))
+            .ok_or_else(|| "this document already has the maximum number of presence participants".to_string())?;
+        let id = Uuid::new_v4().to_string();
+        participants.insert(id.clone(), PresenceParticipant { name: name.clone(), last_heartbeat: now });
+        match presence_roster_json(&participants) {
+            Ok(roster) => Ok((id, name, roster)),
+            Err(error) => {
+                participants.remove(&id);
+                Err(error)
+            }
+        }
+    }
+
+    fn heartbeat_at(&self, id: &str, now: Instant) -> Result<bool, String> {
+        let mut participants = self.participants.lock().map_err(|_| "presence room lock was poisoned".to_string())?;
+        let Some(participant) = participants.get_mut(id) else { return Ok(false) };
+        participant.last_heartbeat = now;
+        Ok(true)
+    }
+
+    fn expire_at(&self, now: Instant) -> Result<Option<String>, String> {
+        let mut participants = self.participants.lock().map_err(|_| "presence room lock was poisoned".to_string())?;
+        let expired: Vec<String> = participants
+            .iter()
+            .filter(|(_, participant)| now.saturating_duration_since(participant.last_heartbeat) >= PRESENCE_HEARTBEAT_TIMEOUT)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if expired.is_empty() {
+            return Ok(None);
+        }
+        for id in expired {
+            participants.remove(&id);
+        }
+        presence_roster_json(&participants).map(Some)
+    }
+
+    fn remove(&self, id: &str) -> Result<Option<String>, String> {
+        let mut participants = self.participants.lock().map_err(|_| "presence room lock was poisoned".to_string())?;
+        if participants.remove(id).is_none() {
+            return Ok(None);
+        }
+        presence_roster_json(&participants).map(Some)
+    }
+
+    fn contains(&self, id: &str) -> Result<bool, String> {
+        let participants = self.participants.lock().map_err(|_| "presence room lock was poisoned".to_string())?;
+        Ok(participants.contains_key(id))
+    }
+
+    fn is_empty(&self) -> Result<bool, String> {
+        let participants = self.participants.lock().map_err(|_| "presence room lock was poisoned".to_string())?;
+        Ok(participants.is_empty())
+    }
+
+    fn snapshot(&self) -> Result<String, String> {
+        let participants = self.participants.lock().map_err(|_| "presence room lock was poisoned".to_string())?;
+        presence_roster_json(&participants)
+    }
+}
+
+impl PresenceRooms {
+    fn join(&self, document_id: &str) -> Result<PresenceSession, String> {
+        self.join_at(document_id, Instant::now())
+    }
+
+    fn join_at(&self, document_id: &str, now: Instant) -> Result<PresenceSession, String> {
+        let mut rooms = self.rooms.lock().map_err(|_| "presence room registry lock was poisoned".to_string())?;
+        let room = rooms.entry(document_id.to_string()).or_insert_with(|| Arc::new(PresenceRoom::new())).clone();
+        let updates = room.updates.subscribe();
+        if let Some(roster) = room.expire_at(now)? {
+            let _ = room.updates.send(roster);
+        }
+        match room.add_at(now) {
+            Ok((id, _name, roster)) => {
+                let _ = room.updates.send(roster);
+                Ok(PresenceSession { id, room, updates })
+            }
+            Err(error) => {
+                if room.is_empty()? {
+                    rooms.remove(document_id);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn heartbeat_at(&self, session: &PresenceSession, now: Instant) -> Result<bool, String> {
+        session.room.heartbeat_at(&session.id, now)
+    }
+
+    fn leave(&self, document_id: &str, session: &PresenceSession) -> Result<(), String> {
+        if let Some(roster) = session.room.remove(&session.id)? {
+            let _ = session.room.updates.send(roster);
+        }
+        self.cleanup_if_empty(document_id, &session.room)
+    }
+
+    fn cleanup_if_empty(&self, document_id: &str, room: &Arc<PresenceRoom>) -> Result<(), String> {
+        let mut rooms = self.rooms.lock().map_err(|_| "presence room registry lock was poisoned".to_string())?;
+        let is_current_room = rooms.get(document_id).is_some_and(|current| Arc::ptr_eq(current, room));
+        if is_current_room && room.is_empty()? {
+            rooms.remove(document_id);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> Result<bool, String> {
+        let rooms = self.rooms.lock().map_err(|_| "presence room registry lock was poisoned".to_string())?;
+        Ok(rooms.is_empty())
+    }
+}
+
+fn presence_roster_json(participants: &BTreeMap<String, PresenceParticipant>) -> Result<String, String> {
+    let roster = PresenceRoster {
+        kind: "roster",
+        participants: participants
+            .iter()
+            .map(|(id, participant)| PresenceParticipantView { id: id.clone(), name: participant.name.clone() })
+            .collect(),
+    };
+    serde_json::to_string(&roster).map_err(|error| format!("could not encode presence roster: {error}"))
 }
 
 struct CollaborationRoom {
@@ -202,6 +389,132 @@ async fn collaborate(State(state): State<AppState>, AxumPath(id): AxumPath<Strin
         .max_frame_size(MAX_COLLAB_UPDATE_BYTES)
         .on_upgrade(move |socket| collaboration_socket(socket, state, id))
         .into_response()
+}
+
+async fn presence(State(state): State<AppState>, AxumPath(id): AxumPath<String>, ws: WebSocketUpgrade) -> Result<Response, ApiError> {
+    let document_id = id.clone();
+    in_store(state.store.clone(), move |store| store.get(&document_id).map(|_| ())).await?;
+    Ok(ws
+        .max_message_size(MAX_PRESENCE_MESSAGE_BYTES)
+        .max_frame_size(MAX_PRESENCE_MESSAGE_BYTES)
+        .on_upgrade(move |socket| presence_socket(socket, state, id))
+        .into_response())
+}
+
+async fn presence_socket(mut socket: WebSocket, state: AppState, document_id: String) {
+    let mut presence = match state.presence_rooms.join(&document_id) {
+        Ok(presence) => presence,
+        Err(error) => {
+            let _ = socket.send(close_message(close_code::POLICY, &error)).await;
+            return;
+        }
+    };
+    let (mut sender, mut incoming) = socket.split();
+    let mut sweep = tokio::time::interval_at(tokio::time::Instant::now() + PRESENCE_SWEEP_INTERVAL, PRESENCE_SWEEP_INTERVAL);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            message = incoming.next() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        if text.len() > MAX_PRESENCE_MESSAGE_BYTES {
+                            let _ = sender.send(close_message(close_code::POLICY, "presence messages are limited to 1 KiB")).await;
+                            break;
+                        }
+                        match serde_json::from_str::<PresenceClientMessage>(text.as_str()) {
+                            Ok(PresenceClientMessage { kind }) if kind == "heartbeat" => {
+                                match state.presence_rooms.heartbeat_at(&presence, Instant::now()) {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        let _ = sender.send(close_message(close_code::POLICY, "presence session expired")).await;
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        eprintln!("WordCraft presence heartbeat failed: {error}");
+                                        let _ = sender.send(close_message(close_code::ERROR, "presence state is unavailable")).await;
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                let _ = sender.send(close_message(close_code::UNSUPPORTED, "send JSON heartbeat messages only")).await;
+                                break;
+                            }
+                            Err(_) => {
+                                let _ = sender.send(close_message(close_code::UNSUPPORTED, "invalid presence JSON message")).await;
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Binary(_))) => {
+                        let _ = sender.send(close_message(close_code::UNSUPPORTED, "send JSON heartbeat messages only")).await;
+                        break;
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                }
+            }
+            update = presence.updates.recv() => {
+                match update {
+                    Ok(roster) => {
+                        if sender.send(Message::Text(roster.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        match presence.room.snapshot() {
+                            Ok(roster) => {
+                                if sender.send(Message::Text(roster.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("WordCraft presence roster failed: {error}");
+                                let _ = sender.send(close_message(close_code::ERROR, "presence state is unavailable")).await;
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = sweep.tick() => {
+                match presence.room.expire_at(Instant::now()) {
+                    Ok(Some(roster)) => {
+                        let _ = presence.room.updates.send(roster);
+                        if let Err(error) = state.presence_rooms.cleanup_if_empty(&document_id, &presence.room) {
+                            eprintln!("WordCraft presence room cleanup failed: {error}");
+                            let _ = sender.send(close_message(close_code::ERROR, "presence state is unavailable")).await;
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("WordCraft presence timeout sweep failed: {error}");
+                        let _ = sender.send(close_message(close_code::ERROR, "presence state is unavailable")).await;
+                        break;
+                    }
+                }
+                match presence.room.contains(&presence.id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = sender.send(close_message(close_code::POLICY, "presence heartbeat timed out")).await;
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("WordCraft presence membership check failed: {error}");
+                        let _ = sender.send(close_message(close_code::ERROR, "presence state is unavailable")).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Err(error) = state.presence_rooms.leave(&document_id, &presence) {
+        eprintln!("WordCraft presence participant cleanup failed: {error}");
+    }
 }
 
 async fn collaboration_socket(mut socket: WebSocket, state: AppState, id: String) {
@@ -2084,6 +2397,207 @@ mod tests {
             ClientMessage::Binary(bytes) => bytes.to_vec(),
             _ => Vec::new(),
         }
+    }
+
+    async fn next_client_text<S>(stream: &mut S) -> String
+    where
+        S: Stream<Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("websocket message arrives before timeout")
+            .expect("websocket remains open")
+            .expect("websocket message is valid");
+        match message {
+            ClientMessage::Text(text) => text.to_string(),
+            other => panic!("server message should be JSON text: {other:?}"),
+        }
+    }
+
+    async fn expect_client_closed<S>(stream: &mut S)
+    where
+        S: Stream<Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        let message = tokio::time::timeout(Duration::from_secs(5), stream.next()).await.expect("server closes unsupported presence socket");
+        assert!(matches!(message, None | Some(Ok(ClientMessage::Close(_))) | Some(Err(_))), "unexpected message before close: {message:?}");
+    }
+
+    async fn start_test_server(store: Arc<Store>) -> (String, tokio::task::JoinHandle<()>) {
+        let app = super::api_router(store).expect("router acquires database lock");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("server listener binds");
+        let address = listener.local_addr().expect("server address is available");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.expect("server serves requests") });
+        (format!("ws://{address}"), server)
+    }
+
+    fn cleanup_server_test(path: &PathBuf) {
+        cleanup(path);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".wordcraft-server.lock");
+        let _ = std::fs::remove_file(PathBuf::from(lock_path));
+    }
+
+    #[test]
+    fn presence_heartbeat_refreshes_timeout_and_empty_rooms_are_removed() {
+        let rooms = super::PresenceRooms::default();
+        let start = super::Instant::now();
+        let mut session = rooms.join_at("presence-doc", start).expect("first participant joins");
+        let initial = session.updates.try_recv().expect("join publishes initial roster");
+        let initial: serde_json::Value = serde_json::from_str(&initial).expect("roster is JSON");
+        assert_eq!(initial["kind"], "roster");
+        assert_eq!(initial["participants"][0]["name"], "Guest 1");
+        assert!(uuid::Uuid::parse_str(initial["participants"][0]["id"].as_str().expect("participant id is a string")).is_ok());
+
+        assert!(rooms.heartbeat_at(&session, start + Duration::from_secs(40)).expect("heartbeat refreshes participant"));
+        assert!(session.room.expire_at(start + Duration::from_secs(80)).expect("sweep succeeds").is_none());
+        let expired_roster = session
+            .room
+            .expire_at(start + Duration::from_secs(86))
+            .expect("45-second heartbeat timeout is swept")
+            .expect("expired participant changes roster");
+        let expired_roster: serde_json::Value = serde_json::from_str(&expired_roster).expect("expiry roster is JSON");
+        assert!(expired_roster["participants"].as_array().expect("participants is an array").is_empty());
+        assert!(!session.room.contains(&session.id).expect("room membership reads"));
+        rooms.cleanup_if_empty("presence-doc", &session.room).expect("empty room is removed");
+        assert!(rooms.is_empty().expect("presence registry reads"));
+        assert!(!rooms.heartbeat_at(&session, start + Duration::from_secs(87)).expect("expired heartbeat is rejected"));
+    }
+
+    #[test]
+    fn presence_room_caps_participants_at_128_and_cleans_up_on_last_leave() {
+        let rooms = super::PresenceRooms::default();
+        let start = super::Instant::now();
+        let mut sessions = Vec::with_capacity(super::MAX_PRESENCE_PARTICIPANTS);
+        for offset in 0..super::MAX_PRESENCE_PARTICIPANTS {
+            sessions.push(rooms.join_at("full-room", start + Duration::from_millis(offset as u64)).expect("participant joins within limit"));
+        }
+        assert!(rooms.join_at("full-room", start + Duration::from_secs(1)).is_err(), "the 129th participant is refused");
+        for session in &sessions {
+            rooms.leave("full-room", session).expect("participant leave broadcasts and cleans up");
+        }
+        assert!(rooms.is_empty().expect("empty room is removed from the registry"));
+    }
+
+    #[tokio::test]
+    async fn presence_websocket_roster_tracks_join_heartbeat_and_leave_without_persistence() {
+        let path = test_path("presence-roster");
+        let store = Arc::new(Store::open(&path).expect("store opens"));
+        let created = store
+            .create("Presence document", wordcraft_engine::io::storage_snapshot(&Document::from_text("unchanged")).expect("snapshot"))
+            .expect("document creates");
+        let version = created.summary.version;
+        let (base, server) = start_test_server(store.clone()).await;
+        let url = format!("{base}/api/documents/{}/presence", created.summary.id);
+
+        let (mut alice, _) = tokio_tungstenite::connect_async(&url).await.expect("Alice joins presence room");
+        let alice_join: serde_json::Value = serde_json::from_str(&next_client_text(&mut alice).await).expect("Alice roster is JSON");
+        assert_eq!(alice_join["kind"], "roster");
+        let alice_entry = alice_join["participants"].as_array().expect("roster participants array").first().expect("Alice is listed").clone();
+        let alice_id = alice_entry["id"].as_str().expect("server assigns a participant id").to_string();
+        assert_eq!(alice_entry["name"], "Guest 1");
+
+        let (mut bob, _) = tokio_tungstenite::connect_async(&url).await.expect("Bob joins presence room");
+        let bob_join: serde_json::Value = serde_json::from_str(&next_client_text(&mut bob).await).expect("Bob roster is JSON");
+        let alice_update: serde_json::Value = serde_json::from_str(&next_client_text(&mut alice).await).expect("Alice receives join roster");
+        let bob_entries = bob_join["participants"].as_array().expect("Bob roster participant array");
+        assert_eq!(bob_entries.len(), 2);
+        assert_eq!(alice_update["participants"], bob_join["participants"], "both sockets receive the same fresh roster");
+        assert!(bob_entries.iter().any(|participant| participant["id"] == alice_id));
+        let bob_entry = bob_entries.iter().find(|participant| participant["id"] != alice_id).expect("Bob gets a distinct server id");
+        assert_ne!(bob_entry["id"], alice_id);
+        assert_eq!(bob_entry["name"], "Guest 2");
+
+        bob.send(ClientMessage::Close(None)).await.expect("Bob closes presence socket");
+        let alice_leave: serde_json::Value = serde_json::from_str(&next_client_text(&mut alice).await).expect("Alice receives leave roster");
+        assert_eq!(alice_leave["participants"].as_array().expect("leave participants array").len(), 1);
+        assert_eq!(alice_leave["participants"][0]["id"], alice_id);
+
+        alice.send(ClientMessage::Text(r#"{"kind":"heartbeat"}"#.into())).await.expect("heartbeat is accepted");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), alice.next()).await.is_err(),
+            "heartbeat receives no application-level response and keeps the socket open"
+        );
+
+        let stored = store.get(&created.summary.id).expect("document remains available");
+        assert_eq!(stored.summary.version, version, "presence does not advance document version");
+        assert!(!stored.summary.snapshot_locked, "presence does not seed a collaboration epoch");
+        let (epoch_count, update_count) = {
+            let connection = store.connection().expect("database connection locks");
+            let epoch_count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM collaboration_documents WHERE document_id = ?1", [&created.summary.id], |row| row.get(0))
+                .expect("collaboration epoch count reads");
+            let update_count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM collaboration_updates WHERE document_id = ?1", [&created.summary.id], |row| row.get(0))
+                .expect("collaboration update count reads");
+            (epoch_count, update_count)
+        };
+        assert_eq!(epoch_count, 0);
+        assert_eq!(update_count, 0);
+
+        alice.send(ClientMessage::Close(None)).await.expect("Alice closes presence socket");
+        server.abort();
+        let _ = server.await;
+        drop(store);
+        cleanup_server_test(&path);
+    }
+
+    #[tokio::test]
+    async fn presence_requires_an_existing_non_deleted_document() {
+        let path = test_path("presence-document-check");
+        let store = Arc::new(Store::open(&path).expect("store opens"));
+        let created = store
+            .create("Deleted document", wordcraft_engine::io::storage_snapshot(&Document::from_text("text")).expect("snapshot"))
+            .expect("document creates");
+        store.set_deleted(&created.summary.id, created.summary.version, true).expect("document soft-deletes");
+        let (base, server) = start_test_server(store.clone()).await;
+
+        for id in ["missing-document", created.summary.id.as_str()] {
+            let url = format!("{base}/api/documents/{id}/presence");
+            match tokio_tungstenite::connect_async(&url).await {
+                Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+                }
+                Err(error) => panic!("missing/deleted document should fail with HTTP 404: {error}"),
+                Ok((mut socket, _)) => {
+                    let _ = socket.close(None).await;
+                    panic!("presence socket opened for missing/deleted document");
+                }
+            }
+        }
+
+        server.abort();
+        let _ = server.await;
+        drop(store);
+        cleanup_server_test(&path);
+    }
+
+    #[tokio::test]
+    async fn presence_rejects_malformed_unsupported_and_oversized_messages() {
+        let path = test_path("presence-invalid-messages");
+        let store = Arc::new(Store::open(&path).expect("store opens"));
+        let created = store
+            .create("Presence document", wordcraft_engine::io::storage_snapshot(&Document::from_text("text")).expect("snapshot"))
+            .expect("document creates");
+        let (base, server) = start_test_server(store.clone()).await;
+        let url = format!("{base}/api/documents/{}/presence", created.summary.id);
+        let invalid_messages = [
+            ClientMessage::Text("{".into()),
+            ClientMessage::Text(r#"{"kind":"cursor"}"#.into()),
+            ClientMessage::Text(r#"{"kind":"heartbeat","id":"client-chosen"}"#.into()),
+            ClientMessage::Binary(vec![1, 2, 3].into()),
+            ClientMessage::Text("x".repeat(super::MAX_PRESENCE_MESSAGE_BYTES + 1).into()),
+        ];
+        for invalid in invalid_messages {
+            let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.expect("presence socket joins");
+            let _ = next_client_text(&mut socket).await;
+            socket.send(invalid).await.expect("invalid test frame sends");
+            expect_client_closed(&mut socket).await;
+        }
+
+        server.abort();
+        let _ = server.await;
+        drop(store);
+        cleanup_server_test(&path);
     }
 
     #[test]
