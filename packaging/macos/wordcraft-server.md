@@ -46,11 +46,14 @@ The web app and API share an origin when served by this binary, so the client ne
 CORS policy. Use HTTPS at the reverse proxy for browser features that require a secure context,
 including WebGPU on non-localhost addresses; the editor retains its WebGL2 fallback.
 
-Live collaboration is currently limited to one unformatted body paragraph. Its durable update log
-is not compacted, and live edits do not appear in immutable version history; snapshot save and
-restore are disabled for documents that have entered this mode. See
-[the collaboration model and remaining scope](../../docs/collaboration-model.md) before enabling
-it for company documents.
+Live collaboration supports fixed body text and direct bold, italic, and single underline across
+up to 256 paragraphs, including multiple paragraphs in one-level unmerged table cells. Nested or
+merged cells and document-structure changes are rejected. The durable update log is not compacted,
+live edits do not appear in immutable version history, and automatic rejoin of unconfirmed edits
+after a page reload is not implemented. Snapshot save and restore are disabled for documents that
+have entered a live-text epoch. Table-cell, cursor, and presence overlays still need browser
+acceptance. See [the collaboration model and remaining scope](../../docs/collaboration-model.md)
+before enabling it for company documents.
 
 ## Backup service
 
