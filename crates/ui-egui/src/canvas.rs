@@ -20,6 +20,8 @@ const RULER: f32 = 22.0;
 
 pub struct CanvasState {
     textures: HashMap<usize, (u64, TextureHandle)>,
+    /// Host-supplied, transient collaborator selections and carets to paint over the pages.
+    pub remote_selections: Vec<RemoteSelection>,
     pub scroll_to_caret: bool,
     pub caret_visible_since: f64,
     dragging: bool,
@@ -40,10 +42,23 @@ pub struct CanvasState {
     pub context_synonyms: Option<serde_json::Value>,
 }
 
+/// A remote participant's transient selection or caret for canvas display.
+///
+/// `label` is an ephemeral roster label, not a durable account name. This value is presentation
+/// data only: it does not participate in local selection, hit testing, or document rendering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteSelection {
+    pub anchor: Pos,
+    pub focus: Pos,
+    pub label: String,
+    pub color: Color32,
+}
+
 impl Default for CanvasState {
     fn default() -> Self {
         CanvasState {
             textures: HashMap::new(),
+            remote_selections: Vec::new(),
             scroll_to_caret: true,
             caret_visible_since: 0.0,
             dragging: false,
@@ -276,6 +291,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         app.canvas.textures.retain(|k, _| *k < n);
         app.canvas.page_rects = rects.clone();
         balloons(app, ui, &painter, &rects, &layout, geo.scale);
+        remote_selection_highlights(app, &painter, &rects, &layout, geo.scale);
         // Selection.
         if !app.session.sel.is_collapsed() {
             let (a, b) = app.session.sel.ordered();
@@ -287,6 +303,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 }
             }
         }
+        remote_carets_and_labels(app, ui, &painter, &rects, &layout, geo.scale);
         // Caret.
         let focused = resp.has_focus() || app.canvas.focused;
         if let Some(c) = layout.caret_on(&app.session.sel.focus, app.session.page_hint)
@@ -355,6 +372,68 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     if let (Some(h), Some(v)) = (hruler, vruler) {
         rulers(app, ui, h, v, &rects, &layout, geo.scale);
     }
+}
+
+/// Paint remote text selections over the page images, using the page rectangles from this frame.
+fn remote_selection_highlights(app: &WordApp, painter: &egui::Painter, rects: &[Rect], layout: &DocLayout, scale: f32) {
+    for remote in &app.canvas.remote_selections {
+        if !valid_remote_body_position(app, &remote.anchor) || !valid_remote_body_position(app, &remote.focus) {
+            continue;
+        }
+        let fill = remote.color.to_opaque().gamma_multiply(0.25);
+        for (page, highlight) in layout.selection_rects(&app.session.doc, &remote.anchor, &remote.focus, app.session.page_hint) {
+            if let Some(page_rect) = rects.get(page) {
+                let screen_rect = Rect::from_min_size(
+                    pos2(page_rect.min.x + highlight.x * scale, page_rect.min.y + highlight.y * scale),
+                    vec2(highlight.w * scale, highlight.h * scale),
+                )
+                .intersect(*page_rect);
+                if screen_rect.is_positive() {
+                    painter.rect_filled(screen_rect, 0.0, fill);
+                }
+            }
+        }
+    }
+}
+
+/// Paint remote caret bars and ephemeral roster labels after the local selection highlight.
+fn remote_carets_and_labels(app: &WordApp, ui: &Ui, painter: &egui::Painter, rects: &[Rect], layout: &DocLayout, scale: f32) {
+    for remote in &app.canvas.remote_selections {
+        if !valid_remote_body_position(app, &remote.focus) {
+            continue;
+        }
+        let Some(caret) = layout.caret_on(&remote.focus, app.session.page_hint) else { continue };
+        let Some(page_rect) = rects.get(caret.page) else { continue };
+        let x = page_rect.min.x + caret.x * scale;
+        let y0 = page_rect.min.y + caret.top * scale;
+        let y1 = y0 + caret.height * scale;
+        let label_color = remote.color.to_opaque();
+        painter.line_segment([pos2(x.round() + 0.5, y0), pos2(x.round() + 0.5, y1)], Stroke::new(2.0, label_color));
+
+        // Roster labels are transient and untrusted. Keep the rendered label short and on one line.
+        let label: String = remote.label.chars().filter(|character| !character.is_control()).take(32).collect();
+        let label = if label.is_empty() { "Guest" } else { label.as_str() };
+        let text_color = if u32::from(label_color.r()) * 299 + u32::from(label_color.g()) * 587 + u32::from(label_color.b()) * 114 > 150_000 {
+            Color32::BLACK
+        } else {
+            Color32::WHITE
+        };
+        let font = semibold(11.0);
+        let text_size = ui.ctx().fonts_mut(|fonts| fonts.layout_no_wrap(label.to_string(), font.clone(), text_color).size());
+        let label_size = vec2(text_size.x + 8.0, text_size.y + 4.0);
+        let label_x = (x + 3.0).min((page_rect.max.x - label_size.x).max(page_rect.min.x));
+        let label_y = (y0 - label_size.y).clamp(page_rect.min.y, (page_rect.max.y - label_size.y).max(page_rect.min.y));
+        let label_rect = Rect::from_min_size(pos2(label_x, label_y), label_size);
+        painter.rect_filled(label_rect, 2.0, label_color);
+        painter.with_clip_rect(label_rect).text(label_rect.min + vec2(4.0, 2.0), egui::Align2::LEFT_TOP, label, font, text_color);
+    }
+}
+
+fn valid_remote_body_position(app: &WordApp, pos: &Pos) -> bool {
+    if pos.story != StoryRef::Body || pos.path.0.len() != 1 {
+        return false;
+    }
+    app.session.doc.para_at(pos).is_some_and(|paragraph| pos.off <= paragraph.text.len() && paragraph.text.is_char_boundary(pos.off))
 }
 
 /// Comment balloons in the markup area right of each page, joined to their anchors.

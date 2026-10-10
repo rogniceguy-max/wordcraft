@@ -1,16 +1,20 @@
 //! Narrow fixed-structure live text collaboration for the browser editor.
 //!
-//! The adapter shares only a frozen sequence of plain-text body paragraphs. Rich structure and
-//! cursor sharing is outside this mode; anonymous room presence uses a separate ephemeral socket.
+//! The adapter shares only a frozen sequence of plain-text body paragraphs. Rich structure remains
+//! outside this mode; anonymous presence and cursor sharing use a separate ephemeral socket.
 //! The ordinary WordCraft `Session` remains the visible editor model.
 
 use wordcraft_doc::props::Underline;
 use wordcraft_doc::{Block, CharProps, Document, Path, Pos, Run, StoryRef};
 use wordcraft_engine::{Selection, Session};
+#[cfg(any(target_arch = "wasm32", test))]
+use yrs::branch::Branch;
 use yrs::types::Attrs;
 use yrs::types::text::YChange;
 use yrs::undo::{Options as UndoOptions, UndoManager};
 use yrs::updates::decoder::Decode;
+#[cfg(any(target_arch = "wasm32", test))]
+use yrs::updates::encoder::Encode;
 use yrs::{
     Any, Assoc, Doc, GetString, IndexedSequence, OffsetKind, Options as DocOptions, Out, ReadTxn, StateVector, StickyIndex, Text, TextRef, Transact,
     Update,
@@ -53,7 +57,13 @@ const PRESENCE_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 #[cfg(any(target_arch = "wasm32", test))]
 const PRESENCE_MAX_FRAME_BYTES: usize = 64 * 1024;
 #[cfg(any(target_arch = "wasm32", test))]
-const PRESENCE_MAX_PARTICIPANTS: usize = 256;
+const PRESENCE_MAX_PARTICIPANTS: usize = 128;
+#[cfg(any(target_arch = "wasm32", test))]
+const PRESENCE_MAX_STICKY_CHARS: usize = 128;
+#[cfg(any(target_arch = "wasm32", test))]
+const PRESENCE_MAX_CLIENT_FRAME_BYTES: usize = 1024;
+#[cfg(any(target_arch = "wasm32", test))]
+const PRESENCE_CURSOR_THROTTLE_MS: u64 = 100;
 #[cfg(target_arch = "wasm32")]
 const CONNECT_TIMEOUT_MS: u64 = 15_000;
 
@@ -163,11 +173,33 @@ impl PresenceHeartbeatSchedule {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PresenceAnchor {
+    paragraph: usize,
+    sticky: StickyIndex,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PresenceCursor {
+    anchor: PresenceAnchor,
+    focus: PresenceAnchor,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PresenceParticipant {
     id: String,
     name: String,
+    cursor: Option<PresenceCursor>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresenceSessionMessage {
+    kind: String,
+    id: String,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -175,7 +207,53 @@ struct PresenceParticipant {
 #[serde(deny_unknown_fields)]
 struct PresenceRosterMessage {
     kind: String,
-    participants: Vec<PresenceParticipant>,
+    participants: Vec<PresenceParticipantMessage>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresenceParticipantMessage {
+    id: String,
+    name: String,
+    cursor: serde_json::Value,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresenceCursorMessage {
+    anchor: PresenceAnchorMessage,
+    focus: PresenceAnchorMessage,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresenceAnchorMessage {
+    paragraph: usize,
+    sticky: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_presence_session(message: &str) -> Result<String, String> {
+    if message.len() > PRESENCE_MAX_CLIENT_FRAME_BYTES {
+        return Err("The presence session handshake exceeded its size limit.".into());
+    }
+    let session: PresenceSessionMessage = serde_json::from_str(message).map_err(|error| format!("Invalid presence session: {error}"))?;
+    if session.kind != "session" || !valid_presence_label(&session.id) {
+        return Err("The presence server sent an invalid session identifier.".into());
+    }
+    Ok(session.id)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn presence_message_kind(message: &str) -> Result<String, String> {
+    if message.len() > PRESENCE_MAX_FRAME_BYTES {
+        return Err("The presence message exceeded its size limit.".into());
+    }
+    let value: serde_json::Value = serde_json::from_str(message).map_err(|error| format!("Invalid presence message: {error}"))?;
+    value.get("kind").and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| "The presence message has no kind.".into())
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -191,24 +269,134 @@ fn parse_presence_roster(message: &str) -> Result<Vec<PresenceParticipant>, Stri
         return Err("The presence roster contains too many participants.".into());
     }
     let mut ids = std::collections::BTreeSet::new();
-    for participant in &roster.participants {
-        if participant.id.is_empty()
-            || participant.id.len() > 128
-            || participant.name.is_empty()
-            || participant.name.len() > 128
-            || participant.id.chars().any(char::is_control)
-            || participant.name.chars().any(char::is_control)
-            || !ids.insert(participant.id.as_str())
-        {
+    let mut participants = Vec::with_capacity(roster.participants.len());
+    for participant in roster.participants {
+        if !valid_presence_label(&participant.id) || !valid_presence_label(&participant.name) || !ids.insert(participant.id.clone()) {
             return Err("The presence roster contains an invalid participant.".into());
         }
+        let cursor = if participant.cursor.is_null() {
+            None
+        } else {
+            let cursor: PresenceCursorMessage =
+                serde_json::from_value(participant.cursor).map_err(|error| format!("The presence roster contains an invalid cursor: {error}"))?;
+            Some(parse_presence_cursor(cursor)?)
+        };
+        participants.push(PresenceParticipant { id: participant.id, name: participant.name, cursor });
     }
-    Ok(roster.participants)
+    Ok(participants)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_presence_cursor(cursor: PresenceCursorMessage) -> Result<PresenceCursor, String> {
+    Ok(PresenceCursor { anchor: parse_presence_anchor(cursor.anchor)?, focus: parse_presence_anchor(cursor.focus)? })
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_presence_anchor(anchor: PresenceAnchorMessage) -> Result<PresenceAnchor, String> {
+    if anchor.paragraph >= MAX_SHARED_PARAGRAPHS {
+        return Err("The presence cursor points outside the fixed body paragraph range.".into());
+    }
+    if anchor.sticky.is_empty() || anchor.sticky.len() > PRESENCE_MAX_STICKY_CHARS {
+        return Err("The presence cursor sticky position exceeded its size limit.".into());
+    }
+    let bytes = wordcraft_engine::cmd::insert::base64_decode(&anchor.sticky)
+        .filter(|bytes| wordcraft_engine::cmd::insert::base64_encode(bytes) == anchor.sticky)
+        .ok_or_else(|| "The presence cursor sticky position is not standard base64.".to_string())?;
+    let sticky = StickyIndex::decode_v1(&bytes).map_err(|error| format!("Invalid presence cursor sticky position: {error}"))?;
+    if sticky.encode_v1() != bytes {
+        return Err("The presence cursor sticky position has trailing data.".into());
+    }
+    Ok(PresenceAnchor { paragraph: anchor.paragraph, sticky })
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn valid_presence_label(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn encode_presence_cursor(selection: &RelativeSelection) -> Result<String, String> {
+    let sticky = |index: &StickyIndex| wordcraft_engine::cmd::insert::base64_encode(&index.encode_v1());
+    let message = serde_json::json!({
+        "kind": "cursor",
+        "anchor": {"paragraph": selection.anchor_paragraph, "sticky": sticky(&selection.anchor)},
+        "focus": {"paragraph": selection.focus_paragraph, "sticky": sticky(&selection.focus)},
+    });
+    let encoded = serde_json::to_string(&message).map_err(|error| format!("Could not encode presence cursor: {error}"))?;
+    if encoded.len() > PRESENCE_MAX_CLIENT_FRAME_BYTES {
+        return Err("The presence cursor exceeded its size limit.".into());
+    }
+    Ok(encoded)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 fn presence_heartbeat_json() -> &'static str {
     r#"{"kind":"heartbeat"}"#
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PresenceCursorSchedule {
+    last_sent: Option<String>,
+    pending: Option<String>,
+    next_at_ms: Option<u64>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl PresenceCursorSchedule {
+    fn queue(&mut self, payload: String, now_ms: u64) {
+        if self.last_sent.as_deref() == Some(payload.as_str()) {
+            self.pending = None;
+            return;
+        }
+        if self.pending.as_deref() == Some(payload.as_str()) {
+            return;
+        }
+        self.pending = Some(payload);
+        self.next_at_ms.get_or_insert(now_ms);
+    }
+
+    fn due(&mut self, now_ms: u64) -> Option<String> {
+        if !self.next_at_ms.is_some_and(|next_at_ms| now_ms >= next_at_ms) {
+            return None;
+        }
+        let payload = self.pending.take()?;
+        self.last_sent = Some(payload.clone());
+        self.next_at_ms = Some(now_ms.saturating_add(PRESENCE_CURSOR_THROTTLE_MS));
+        Some(payload)
+    }
+
+    fn wait_ms(&self, now_ms: u64) -> Option<u64> {
+        self.pending.as_ref()?;
+        self.next_at_ms.map(|next_at_ms| next_at_ms.saturating_sub(now_ms))
+    }
+
+    fn reset_for_reconnect(&mut self) {
+        self.last_sent = None;
+        self.pending = None;
+        self.next_at_ms = None;
+    }
+
+    fn clear(&mut self) {
+        self.reset_for_reconnect();
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn presence_color(id: &str) -> egui::Color32 {
+    const PALETTE: [[u8; 3]; 8] = [
+        [0x1c, 0x7e, 0xd6],
+        [0xe6, 0x77, 0x00],
+        [0x70, 0x48, 0xe8],
+        [0x2f, 0x9e, 0x44],
+        [0xd6, 0x33, 0x6c],
+        [0x0c, 0x85, 0x99],
+        [0xb0, 0x89, 0x00],
+        [0xc9, 0x2a, 0x2a],
+    ];
+    let hash = id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3));
+    let rgb = PALETTE[(hash as usize) % PALETTE.len()];
+    egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -467,6 +655,14 @@ impl LiveText {
     fn shared_paragraphs(&self) -> Result<Vec<SharedParagraph>, String> {
         let transaction = self.doc.transact();
         self.texts.iter().map(|text| paragraph_from_shared_text(text, &transaction)).collect()
+    }
+
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn resolve_presence_cursor(&self, cursor: &PresenceCursor) -> Option<(Pos, Pos)> {
+        let transaction = self.doc.transact();
+        let anchor = resolve_presence_anchor(&self.texts, &cursor.anchor, &transaction)?;
+        let focus = resolve_presence_anchor(&self.texts, &cursor.focus, &transaction)?;
+        Some((anchor, focus))
     }
 
     fn editor_matches_shared(&self, document: &Document) -> Result<bool, String> {
@@ -761,6 +957,39 @@ impl LiveText {
     }
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+fn resolve_presence_anchor<T: ReadTxn>(texts: &[TextRef], anchor: &PresenceAnchor, transaction: &T) -> Option<Pos> {
+    let text = texts.get(anchor.paragraph)?;
+    let offset = anchor.sticky.get_offset(transaction)?;
+    let resolved_branch: &Branch = offset.branch.as_ref();
+    let expected_branch: &Branch = <TextRef as AsRef<Branch>>::as_ref(text);
+    if resolved_branch.id() != expected_branch.id() {
+        return None;
+    }
+    let content = text.get_string(transaction);
+    if usize::try_from(offset.index).ok()? > content.encode_utf16().count() {
+        return None;
+    }
+    let byte_offset = utf16_to_byte_offset_exact(&content, offset.index)?;
+    content.is_char_boundary(byte_offset).then(|| Pos::body(anchor.paragraph, byte_offset))
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn utf16_to_byte_offset_exact(text: &str, utf16_offset: u32) -> Option<usize> {
+    let target = usize::try_from(utf16_offset).ok()?;
+    let mut units = 0usize;
+    for (byte, ch) in text.char_indices() {
+        if units == target {
+            return Some(byte);
+        }
+        units = units.checked_add(ch.len_utf16())?;
+        if units > target {
+            return None;
+        }
+    }
+    (units == target).then_some(text.len())
+}
+
 fn validate_shared_paragraphs(paragraphs: &[SharedParagraph]) -> Result<(), String> {
     if !(1..=MAX_SHARED_PARAGRAPHS).contains(&paragraphs.len()) {
         return Err(scope_error());
@@ -1004,6 +1233,8 @@ struct PresenceState {
     connection_deadline_ms: Option<u64>,
     reconnect: ReconnectSchedule,
     heartbeat: PresenceHeartbeatSchedule,
+    cursor_schedule: PresenceCursorSchedule,
+    session_id: Option<String>,
     on_open: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>>,
     on_message: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::MessageEvent)>>,
     on_close: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>>,
@@ -1113,6 +1344,8 @@ impl PresenceState {
         self.connection_deadline_ms = None;
         self.reconnect.pause();
         self.heartbeat.pause();
+        self.cursor_schedule.clear();
+        self.session_id = None;
         self.participants.clear();
     }
 
@@ -1121,6 +1354,8 @@ impl PresenceState {
         self.phase = PresencePhase::Offline;
         self.connection_deadline_ms = None;
         self.heartbeat.pause();
+        self.cursor_schedule.clear();
+        self.session_id = None;
         self.participants.clear();
     }
 }
@@ -1166,6 +1401,27 @@ impl CollaborationBridge {
     pub fn snapshot_locked_for(&self, document_id: Option<&str>) -> bool {
         let Ok(state) = self.inner.try_borrow() else { return true };
         document_id.is_some_and(|id| state.epoch_documents.contains(id))
+    }
+
+    pub fn remote_selections(&self) -> Vec<wordcraft_ui_egui::RemoteSelection> {
+        let Ok(state) = self.inner.try_borrow() else { return Vec::new() };
+        if state.phase != ConnectionPhase::Live || state.presence.phase != PresencePhase::Live {
+            return Vec::new();
+        }
+        let (Some(self_id), Some(adapter)) = (state.presence.session_id.as_deref(), state.adapter.as_ref()) else {
+            return Vec::new();
+        };
+        state
+            .presence
+            .participants
+            .iter()
+            .filter(|participant| participant.id != self_id)
+            .filter_map(|participant| {
+                let cursor = participant.cursor.as_ref()?;
+                let (anchor, focus) = adapter.resolve_presence_cursor(cursor)?;
+                Some(wordcraft_ui_egui::RemoteSelection { anchor, focus, label: participant.name.clone(), color: presence_color(&participant.id) })
+            })
+            .collect()
     }
 
     pub fn logic(&self, session: &mut Session, active_document_id: Option<&str>, ctx: &egui::Context) {
@@ -1240,7 +1496,7 @@ impl CollaborationBridge {
             ctx.request_repaint();
         }
         self.maybe_auto_reconnect(active_document_id, ctx);
-        self.update_presence(active_document_id, ctx);
+        self.update_presence(session, active_document_id, ctx);
     }
 
     fn maybe_auto_reconnect(&self, active_document_id: Option<&str>, ctx: &egui::Context) {
@@ -1278,7 +1534,7 @@ impl CollaborationBridge {
         }
     }
 
-    fn update_presence(&self, active_document_id: Option<&str>, ctx: &egui::Context) {
+    fn update_presence(&self, session: &Session, active_document_id: Option<&str>, ctx: &egui::Context) {
         let events = {
             let Ok(mut state) = self.inner.try_borrow_mut() else { return };
             if state.phase != ConnectionPhase::Live || state.document_id.as_deref() != active_document_id {
@@ -1309,9 +1565,19 @@ impl CollaborationBridge {
                 }
                 PresenceSocketEvent::Message { text, .. } => {
                     if state.phase == ConnectionPhase::Live && state.presence.phase == PresencePhase::Live {
-                        match parse_presence_roster(&text) {
-                            Ok(participants) => state.presence.participants = participants,
-                            Err(_) => state.presence.failed(),
+                        match presence_message_kind(&text).as_deref() {
+                            Ok("session") if state.presence.session_id.is_none() => match parse_presence_session(&text) {
+                                Ok(id) => {
+                                    state.presence.session_id = Some(id);
+                                    state.presence.cursor_schedule.reset_for_reconnect();
+                                }
+                                Err(_) => state.presence.failed(),
+                            },
+                            Ok("roster") if state.presence.session_id.is_some() => match parse_presence_roster(&text) {
+                                Ok(participants) => state.presence.participants = participants,
+                                Err(_) => state.presence.failed(),
+                            },
+                            _ => state.presence.failed(),
                         }
                     }
                 }
@@ -1344,7 +1610,28 @@ impl CollaborationBridge {
                     ReconnectDecision::RetryNow => open_document = state.document_id.clone(),
                 },
                 PresencePhase::Live => {
-                    if state.presence.heartbeat.due(now_ms) {
+                    if state.presence.session_id.is_some()
+                        && let Some(cursor) = state
+                            .adapter
+                            .as_ref()
+                            .and_then(|adapter| adapter.capture_selection(session).ok())
+                            .and_then(|selection| encode_presence_cursor(&selection).ok())
+                    {
+                        state.presence.cursor_schedule.queue(cursor, now_ms);
+                    }
+                    if let Some(cursor) = state.presence.cursor_schedule.due(now_ms) {
+                        let cursor_result = state
+                            .presence
+                            .socket
+                            .as_ref()
+                            .filter(|socket| socket.ready_state() == web_sys::WebSocket::OPEN)
+                            .ok_or_else(|| "The presence socket is not open.".to_string())
+                            .and_then(|socket| socket.send_with_str(&cursor).map_err(browser_error));
+                        if cursor_result.is_err() {
+                            state.presence.failed();
+                        }
+                    }
+                    if state.presence.phase == PresencePhase::Live && state.presence.heartbeat.due(now_ms) {
                         let heartbeat_result = state
                             .presence
                             .socket
@@ -1362,7 +1649,14 @@ impl CollaborationBridge {
                         }
                     }
                     if state.presence.phase == PresencePhase::Live {
-                        wait_ms = state.presence.heartbeat.wait_ms(now_ms);
+                        wait_ms =
+                            [state.presence.heartbeat.wait_ms(now_ms), state.presence.cursor_schedule.wait_ms(now_ms)].into_iter().flatten().min();
+                    } else if state.presence.phase == PresencePhase::Offline {
+                        match state.presence.reconnect.tick(now_ms) {
+                            ReconnectDecision::Wait(wait) => wait_ms = Some(wait),
+                            ReconnectDecision::RetryNow => open_document = state.document_id.clone(),
+                            ReconnectDecision::Disabled => {}
+                        }
                     }
                 }
             }
@@ -1392,6 +1686,9 @@ impl CollaborationBridge {
                 state.presence.reconnect.ensure_started();
             }
             state.presence.close_socket();
+            state.presence.session_id = None;
+            state.presence.participants.clear();
+            state.presence.cursor_schedule.reset_for_reconnect();
             state.presence.phase = PresencePhase::Connecting;
             state.presence.connection_deadline_ms = Some(monotonic_now_ms().saturating_add(CONNECT_TIMEOUT_MS));
             state.presence.socket_generation
@@ -2099,16 +2396,19 @@ fn browser_error(error: wasm_bindgen::JsValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTR_BOLD, Any, Attrs, LiveText, MAX_SHARED_PARAGRAPHS, MAX_SHARED_TEXT_BYTES, PRESENCE_HEARTBEAT_INTERVAL_MS, PresenceHeartbeatSchedule,
-        PresenceSocketEvent, ReconnectDecision, ReconnectSchedule, apply_local_text_command, is_current_presence_generation,
-        is_current_socket_generation, one_splice, parse_presence_roster, presence_heartbeat_json, resolve_sticky, selection_format_value,
-        shared_text_root, supported_body, supported_body_text, validate_shared_paragraphs,
+        ATTR_BOLD, Any, Attrs, LiveText, MAX_SHARED_PARAGRAPHS, MAX_SHARED_TEXT_BYTES, PRESENCE_CURSOR_THROTTLE_MS, PRESENCE_HEARTBEAT_INTERVAL_MS,
+        PRESENCE_MAX_CLIENT_FRAME_BYTES, PresenceAnchor, PresenceCursor, PresenceCursorSchedule, PresenceHeartbeatSchedule, PresenceSocketEvent,
+        ReconnectDecision, ReconnectSchedule, RelativeSelection, apply_local_text_command, encode_presence_cursor, is_current_presence_generation,
+        is_current_socket_generation, one_splice, parse_presence_roster, parse_presence_session, presence_color, presence_heartbeat_json,
+        presence_message_kind, resolve_presence_anchor, resolve_sticky, selection_format_value, shared_text_root, supported_body,
+        supported_body_text, validate_shared_paragraphs,
     };
     use serde_json::json;
     use wordcraft_doc::{Block, CharProps, Document, Pos};
     use wordcraft_engine::{Selection, Session};
     use yrs::updates::decoder::Decode;
-    use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
+    use yrs::updates::encoder::Encode;
+    use yrs::{Assoc, Doc, GetString, IndexedSequence, ReadTxn, StateVector, StickyIndex, Text, Transact, Update};
 
     #[test]
     fn automatic_reconnect_uses_exponential_backoff_and_resets_after_sync() {
@@ -2151,17 +2451,124 @@ mod tests {
 
     #[test]
     fn presence_roster_parser_accepts_only_the_roster_contract() {
-        let participants = parse_presence_roster(r#"{"kind":"roster","participants":[{"id":"a1","name":"Guest 1"},{"id":"b2","name":"访客二"}]}"#)
-            .expect("valid anonymous roster parses");
+        let sticky = encoded_empty_text_sticky("presence-test");
+        let message = serde_json::json!({
+            "kind": "roster",
+            "participants": [
+                {"id": "a1", "name": "Guest 1", "cursor": null},
+                {"id": "b2", "name": "访客二", "cursor": {
+                    "anchor": {"paragraph": 0, "sticky": sticky},
+                    "focus": {"paragraph": 1, "sticky": encoded_empty_text_sticky("presence-test-2")}
+                }}
+            ]
+        })
+        .to_string();
+        let participants = parse_presence_roster(&message).expect("valid anonymous roster parses");
         assert_eq!(participants.len(), 2);
         assert_eq!(participants[0].id, "a1");
         assert_eq!(participants[0].name, "Guest 1");
         assert_eq!(participants[1].name, "访客二");
+        assert!(participants[0].cursor.is_none());
+        assert!(participants[1].cursor.is_some());
 
         assert!(parse_presence_roster(r#"{"kind":"heartbeat","participants":[]}"#).is_err());
         assert!(parse_presence_roster(r#"{"kind":"roster","participants":[],"extra":true}"#).is_err());
-        assert!(parse_presence_roster(r#"{"kind":"roster","participants":[{"id":"a1"}]}"#).is_err());
-        assert!(parse_presence_roster(r#"{"kind":"roster","participants":[{"id":"a1","name":"Guest"},{"id":"a1","name":"Guest 2"}]}"#).is_err());
+        assert!(parse_presence_roster(r#"{"kind":"roster","participants":[{"id":"a1","name":"Guest"}]}"#).is_err());
+        assert!(parse_presence_roster(r#"{"kind":"roster","participants":[{"id":"a1","name":"Guest","cursor":null,"extra":true}]}"#).is_err());
+        let duplicate = serde_json::json!({"kind":"roster","participants":[
+            {"id":"a1","name":"Guest","cursor":null}, {"id":"a1","name":"Guest 2","cursor":null}
+        ]})
+        .to_string();
+        assert!(parse_presence_roster(&duplicate).is_err());
+        let bad_paragraph = serde_json::json!({"kind":"roster","participants":[{"id":"a1","name":"Guest","cursor":{
+            "anchor":{"paragraph":256,"sticky":encoded_empty_text_sticky("overflow")},
+            "focus":{"paragraph":0,"sticky":encoded_empty_text_sticky("overflow")}
+        }}]})
+        .to_string();
+        assert!(parse_presence_roster(&bad_paragraph).is_err());
+        let bad_base64 = r#"{"kind":"roster","participants":[{"id":"a1","name":"Guest","cursor":{"anchor":{"paragraph":0,"sticky":"AQ*="},"focus":{"paragraph":0,"sticky":"AQ=="}}}]}"#;
+        assert!(parse_presence_roster(bad_base64).is_err());
+    }
+
+    #[test]
+    fn presence_session_handshake_is_strict_and_bounded() {
+        assert_eq!(parse_presence_session(r#"{"kind":"session","id":"session-1"}"#).as_deref(), Ok("session-1"));
+        assert_eq!(presence_message_kind(r#"{"kind":"session","id":"session-1"}"#).as_deref(), Ok("session"));
+        assert!(parse_presence_session(r#"{"kind":"session","id":"session-1","extra":true}"#).is_err());
+        assert!(parse_presence_session(&format!(r#"{{"kind":"session","id":"{}"}}"#, "x".repeat(1100))).is_err());
+        assert!(presence_message_kind(r#"{"kind":"roster","participants":[],"extra":true}"#).is_ok());
+        assert!(parse_presence_roster(&format!(r#"{{"kind":"roster","participants":[],"filler":"{}"}}"#, "x".repeat(65_000))).is_err());
+    }
+
+    #[test]
+    fn presence_cursor_encoding_is_small_and_uses_paragraph_local_stickies() {
+        let first = encoded_empty_text_sticky("cursor-paragraph-zero");
+        let second = encoded_empty_text_sticky("cursor-paragraph-one");
+        let decode = |encoded: &str| {
+            let bytes = wordcraft_engine::cmd::insert::base64_decode(encoded).expect("base64 output");
+            StickyIndex::decode_v1(&bytes).expect("encoded Yrs sticky position")
+        };
+        let selection =
+            RelativeSelection { anchor_paragraph: 0, focus_paragraph: 1, anchor: decode(&first), focus: decode(&second), collapsed: false };
+        let encoded = encode_presence_cursor(&selection).expect("valid cursor encodes");
+        assert!(encoded.len() <= PRESENCE_MAX_CLIENT_FRAME_BYTES);
+        let value: serde_json::Value = serde_json::from_str(&encoded).expect("cursor JSON");
+        assert_eq!(value["kind"], "cursor");
+        assert_eq!(value["anchor"]["paragraph"], 0);
+        assert_eq!(value["focus"]["paragraph"], 1);
+        assert!(value["anchor"]["sticky"].as_str().is_some_and(|sticky| sticky.len() <= 128));
+    }
+
+    #[test]
+    fn presence_cursor_schedule_coalesces_and_resends_after_reconnect() {
+        let mut schedule = PresenceCursorSchedule::default();
+        schedule.queue("first".into(), 100);
+        assert_eq!(schedule.due(100).as_deref(), Some("first"));
+        schedule.queue("intermediate".into(), 120);
+        schedule.queue("latest".into(), 150);
+        assert_eq!(schedule.wait_ms(150), Some(PRESENCE_CURSOR_THROTTLE_MS - 50));
+        assert_eq!(schedule.due(199), None);
+        assert_eq!(schedule.due(200).as_deref(), Some("latest"));
+        schedule.queue("next".into(), 210);
+        schedule.queue("latest".into(), 220);
+        assert_eq!(schedule.due(300), None, "unchanged selections are not resent on every frame");
+        schedule.reset_for_reconnect();
+        schedule.queue("latest".into(), 400);
+        assert_eq!(schedule.due(400).as_deref(), Some("latest"));
+        schedule.clear();
+        assert_eq!(schedule.wait_ms(500), None);
+    }
+
+    #[test]
+    fn presence_cursor_anchor_rebases_unicode_and_rejects_the_wrong_root() {
+        let live = LiveText::with_paragraph_count(2).expect("fixed roots create");
+        {
+            let mut transaction = live.doc.transact_mut();
+            live.texts[0].insert(&mut transaction, 0, "a😀bc");
+            live.texts[1].insert(&mut transaction, 0, "second");
+        }
+        let sticky = {
+            let transaction = live.doc.transact();
+            live.texts[0].sticky_index(&transaction, 3, Assoc::After).expect("Unicode anchor at paragraph zero")
+        };
+        let anchor = PresenceAnchor { paragraph: 0, sticky: sticky.clone() };
+        {
+            let mut transaction = live.doc.transact_mut();
+            live.texts[0].insert(&mut transaction, 0, "z");
+        }
+        let transaction = live.doc.transact();
+        let resolved = resolve_presence_anchor(&live.texts, &anchor, &transaction).expect("rebased UTF-16 anchor resolves");
+        assert_eq!(resolved, Pos::body(0, 6));
+        let wrong_root = PresenceAnchor { paragraph: 1, sticky: sticky.clone() };
+        assert!(resolve_presence_anchor(&live.texts, &wrong_root, &transaction).is_none());
+        let cursor = PresenceCursor { anchor, focus: PresenceAnchor { paragraph: 0, sticky } };
+        assert_eq!(live.resolve_presence_cursor(&cursor).expect("both endpoints resolve").0, resolved);
+    }
+
+    #[test]
+    fn remote_presence_colors_are_deterministic_and_palette_based() {
+        assert_eq!(presence_color("participant-id"), presence_color("participant-id"));
+        assert_ne!(presence_color("participant-id"), presence_color("another-id"));
     }
 
     #[test]
@@ -2204,6 +2611,14 @@ mod tests {
 
         assert!(events.is_empty());
         assert!(pending_updates.is_empty());
+    }
+
+    fn encoded_empty_text_sticky(root: &str) -> String {
+        let doc = Doc::new();
+        let text = doc.get_or_insert_text(root);
+        let transaction = doc.transact();
+        let sticky = StickyIndex::from_type(&transaction, &text, Assoc::After);
+        wordcraft_engine::cmd::insert::base64_encode(&sticky.encode_v1())
     }
 
     fn seed(text: &str) -> Vec<u8> {

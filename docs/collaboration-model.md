@@ -68,26 +68,37 @@ temporary sessions; they do not authenticate anyone. Focused server/client tests
 fanout, heartbeat expiry, capacity and cleanup, invalid messages, storage isolation, heartbeat
 scheduling, generation filtering, and retry restart after the text channel recovers.
 
-P4.4 still has no shared cursor or selection transport, table-cell editing, paragraph structure
-editing, or automatic reload rejoin. Browser-level three-tab localhost smoke has passed for edits
-in both directions and actor-scoped undo. A separate two-tab smoke confirmed that selected bold,
-italic, and single underline reached both editors and the materialized server snapshot; typing
-inside the styled run preserved those attributes in the server snapshot. Automatic reconnect
-backoff and stale-socket filtering have unit coverage, while browser outage and recovery remain
-unverified. Multi-paragraph collaboration and the new presence channel have not yet had browser
-smoke. Reopening the document after a page reload also showed the durable snapshot-save/restore
-fence. The prior browser checks ran on one Windows host; they do not verify separate computers, IME
+P4.5 extends the ephemeral channel with cursor and selection anchors. Each socket first receives its
+own server-assigned session ID so the browser can omit its own cursor from the canvas. Cursor frames
+carry paragraph indexes and base64-encoded Yrs sticky indexes for both selection endpoints; they do
+not use fixed byte offsets and never enter the document or Yrs update log. The server strictly
+validates the message shape, paragraph range, base64 value and size, and relays the latest roster.
+The client coalesces updates, resolves each anchor against the expected Yrs paragraph root, then
+converts Yrs UTF-16 positions to WordCraft UTF-8 positions. Unresolved or wrong-root anchors are
+hidden without stopping text editing. Canvas overlays use the current frame's page geometry and
+scale, remain outside page textures and local selection state, and show the temporary participant
+label in a deterministic color. Tests cover Unicode rebasing, wrong-root rejection, parser bounds,
+cursor fanout, throttle/coalescing, reconnect resend, and storage isolation.
+
+P4.5 still does not support table-cell editing, paragraph structure editing, or automatic reload
+rejoin. Browser-level three-tab localhost smoke has passed for edits in both directions and
+actor-scoped undo. A separate two-tab smoke confirmed that selected bold, italic, and single
+underline reached both editors and the materialized server snapshot; typing inside the styled run
+preserved those attributes in the server snapshot. Presence and cursor overlays have not yet had
+browser smoke. Automatic reconnect backoff and stale-socket filtering have unit coverage, while
+browser outage and recovery remain unverified. Multi-paragraph collaboration also lacks browser
+smoke. Reopening the document after a page reload showed the durable snapshot-save/restore fence.
+The prior browser checks ran on one Windows host; they do not verify separate computers, IME
 behavior, DOCX round-trip, Mac mini startup/reboot, or the target performance matrix.
 
 ## Integration gate
 
-The next gate is to add cursor and selection transport with CRDT-relative anchors, then fixed-
-topology table-cell text roots. Broader character and paragraph formatting and safe range operations
-follow only after those mappings are tested. The collaboration path also needs a safe way to
-reconcile pending updates after reload, update-log compaction, and a history model that can
-snapshot/restore an epoch without letting stale sessions overwrite it. Automated multi-client
-acceptance should cover same-position insertions, delete/insert races, formatting, table cells, IME
-composition, and server restart before broadening the enabled command set.
+The next gate is fixed-topology table-cell text roots. Broader character and paragraph formatting
+and safe range operations follow only after those mappings are tested. The collaboration path also
+needs a safe way to reconcile pending updates after reload, update-log compaction, and a history
+model that can snapshot/restore an epoch without letting stale sessions overwrite it. Automated
+multi-client acceptance should cover same-position insertions, delete/insert races, formatting,
+table cells, IME composition, and server restart before broadening the enabled command set.
 
 Yrs updates are idempotent and commutative, so transport delivery order need not define the document
 order. Native whole-document undo is reset while live text is active; actor-scoped Yrs undo handles

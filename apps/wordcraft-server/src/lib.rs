@@ -42,6 +42,8 @@ const COLLAB_TEXT_ROOT: &str = "body:main";
 const COLLAB_ROOM_CAPACITY: usize = 256;
 const MAX_PRESENCE_MESSAGE_BYTES: usize = 1024;
 const MAX_PRESENCE_PARTICIPANTS: usize = 128;
+const MAX_PRESENCE_STICKY_CHARS: usize = 128;
+const MAX_PRESENCE_ROSTER_BYTES: usize = 64 * 1024;
 const PRESENCE_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const PRESENCE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -118,6 +120,7 @@ struct PresenceRoom {
 
 struct PresenceParticipant {
     name: String,
+    cursor: Option<PresenceCursor>,
     last_heartbeat: Instant,
 }
 
@@ -137,12 +140,36 @@ struct PresenceRoster {
 struct PresenceParticipantView {
     id: String,
     name: String,
+    cursor: Option<PresenceCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PresenceCursorPosition {
+    paragraph: u16,
+    sticky: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PresenceCursor {
+    anchor: PresenceCursorPosition,
+    focus: PresenceCursorPosition,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PresenceClientMessage {
-    kind: String,
+#[serde(tag = "kind", deny_unknown_fields)]
+enum PresenceClientMessage {
+    #[serde(rename = "heartbeat")]
+    Heartbeat {},
+    #[serde(rename = "cursor")]
+    Cursor { anchor: PresenceCursorPosition, focus: PresenceCursorPosition },
+}
+
+#[derive(Serialize)]
+struct PresenceSessionMessage<'a> {
+    kind: &'static str,
+    id: &'a str,
 }
 
 impl PresenceRoom {
@@ -161,7 +188,7 @@ impl PresenceRoom {
             .find(|candidate| participants.values().all(|participant| participant.name != *candidate))
             .ok_or_else(|| "this document already has the maximum number of presence participants".to_string())?;
         let id = Uuid::new_v4().to_string();
-        participants.insert(id.clone(), PresenceParticipant { name: name.clone(), last_heartbeat: now });
+        participants.insert(id.clone(), PresenceParticipant { name: name.clone(), cursor: None, last_heartbeat: now });
         match presence_roster_json(&participants) {
             Ok(roster) => Ok((id, name, roster)),
             Err(error) => {
@@ -176,6 +203,24 @@ impl PresenceRoom {
         let Some(participant) = participants.get_mut(id) else { return Ok(false) };
         participant.last_heartbeat = now;
         Ok(true)
+    }
+
+    fn set_cursor_at(&self, id: &str, cursor: PresenceCursor, now: Instant) -> Result<Option<String>, String> {
+        let mut participants = self.participants.lock().map_err(|_| "presence room lock was poisoned".to_string())?;
+        let Some(participant) = participants.get_mut(id) else { return Ok(None) };
+        let previous_cursor = participant.cursor.replace(cursor);
+        let previous_heartbeat = participant.last_heartbeat;
+        participant.last_heartbeat = now;
+        match presence_roster_json(&participants) {
+            Ok(roster) => Ok(Some(roster)),
+            Err(error) => {
+                if let Some(participant) = participants.get_mut(id) {
+                    participant.cursor = previous_cursor;
+                    participant.last_heartbeat = previous_heartbeat;
+                }
+                Err(error)
+            }
+        }
     }
 
     fn expire_at(&self, now: Instant) -> Result<Option<String>, String> {
@@ -248,6 +293,12 @@ impl PresenceRooms {
         session.room.heartbeat_at(&session.id, now)
     }
 
+    fn set_cursor_at(&self, session: &PresenceSession, cursor: PresenceCursor, now: Instant) -> Result<bool, String> {
+        let Some(roster) = session.room.set_cursor_at(&session.id, cursor, now)? else { return Ok(false) };
+        let _ = session.room.updates.send(roster);
+        Ok(true)
+    }
+
     fn leave(&self, document_id: &str, session: &PresenceSession) -> Result<(), String> {
         if let Some(roster) = session.room.remove(&session.id)? {
             let _ = session.room.updates.send(roster);
@@ -276,10 +327,55 @@ fn presence_roster_json(participants: &BTreeMap<String, PresenceParticipant>) ->
         kind: "roster",
         participants: participants
             .iter()
-            .map(|(id, participant)| PresenceParticipantView { id: id.clone(), name: participant.name.clone() })
+            .map(|(id, participant)| PresenceParticipantView { id: id.clone(), name: participant.name.clone(), cursor: participant.cursor.clone() })
             .collect(),
     };
-    serde_json::to_string(&roster).map_err(|error| format!("could not encode presence roster: {error}"))
+    let encoded = serde_json::to_string(&roster).map_err(|error| format!("could not encode presence roster: {error}"))?;
+    if encoded.len() > MAX_PRESENCE_ROSTER_BYTES {
+        return Err("presence roster exceeds the 64 KiB client message limit".into());
+    }
+    Ok(encoded)
+}
+
+fn presence_session_json(id: &str) -> Result<String, String> {
+    serde_json::to_string(&PresenceSessionMessage { kind: "session", id }).map_err(|error| format!("could not encode presence session: {error}"))
+}
+
+fn validate_presence_cursor_position(position: &PresenceCursorPosition) -> Result<(), &'static str> {
+    if position.paragraph > 255 {
+        return Err("cursor paragraph index must be between 0 and 255");
+    }
+    if !is_standard_base64_sticky(&position.sticky) {
+        return Err("cursor sticky positions must be 1 to 128 standard base64 characters");
+    }
+    Ok(())
+}
+
+fn validate_presence_cursor(cursor: PresenceCursor) -> Result<PresenceCursor, &'static str> {
+    validate_presence_cursor_position(&cursor.anchor)?;
+    validate_presence_cursor_position(&cursor.focus)?;
+    Ok(cursor)
+}
+
+fn is_standard_base64_sticky(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_PRESENCE_STICKY_CHARS {
+        return false;
+    }
+    let data_len = bytes.iter().position(|byte| *byte == b'=').unwrap_or(bytes.len());
+    let padding_len = bytes.len() - data_len;
+    if padding_len > 2
+        || bytes[..data_len].iter().any(|byte| !byte.is_ascii_alphanumeric() && *byte != b'+' && *byte != b'/')
+        || bytes[data_len..].iter().any(|byte| *byte != b'=')
+    {
+        return false;
+    }
+    match padding_len {
+        0 => data_len % 4 != 1,
+        1 => data_len % 4 == 3,
+        2 => data_len % 4 == 2,
+        _ => false,
+    }
 }
 
 struct CollaborationRoom {
@@ -409,6 +505,19 @@ async fn presence_socket(mut socket: WebSocket, state: AppState, document_id: St
             return;
         }
     };
+    let session_message = match presence_session_json(&presence.id) {
+        Ok(message) => message,
+        Err(error) => {
+            eprintln!("WordCraft presence session encoding failed: {error}");
+            let _ = state.presence_rooms.leave(&document_id, &presence);
+            let _ = socket.send(close_message(close_code::ERROR, "presence state is unavailable")).await;
+            return;
+        }
+    };
+    if socket.send(Message::Text(session_message.into())).await.is_err() {
+        let _ = state.presence_rooms.leave(&document_id, &presence);
+        return;
+    }
     let (mut sender, mut incoming) = socket.split();
     let mut sweep = tokio::time::interval_at(tokio::time::Instant::now() + PRESENCE_SWEEP_INTERVAL, PRESENCE_SWEEP_INTERVAL);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -423,7 +532,7 @@ async fn presence_socket(mut socket: WebSocket, state: AppState, document_id: St
                             break;
                         }
                         match serde_json::from_str::<PresenceClientMessage>(text.as_str()) {
-                            Ok(PresenceClientMessage { kind }) if kind == "heartbeat" => {
+                            Ok(PresenceClientMessage::Heartbeat {}) => {
                                 match state.presence_rooms.heartbeat_at(&presence, Instant::now()) {
                                     Ok(true) => {}
                                     Ok(false) => {
@@ -437,9 +546,26 @@ async fn presence_socket(mut socket: WebSocket, state: AppState, document_id: St
                                     }
                                 }
                             }
-                            Ok(_) => {
-                                let _ = sender.send(close_message(close_code::UNSUPPORTED, "send JSON heartbeat messages only")).await;
-                                break;
+                            Ok(PresenceClientMessage::Cursor { anchor, focus }) => {
+                                let cursor = match validate_presence_cursor(PresenceCursor { anchor, focus }) {
+                                    Ok(cursor) => cursor,
+                                    Err(error) => {
+                                        let _ = sender.send(close_message(close_code::UNSUPPORTED, error)).await;
+                                        break;
+                                    }
+                                };
+                                match state.presence_rooms.set_cursor_at(&presence, cursor, Instant::now()) {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        let _ = sender.send(close_message(close_code::POLICY, "presence session expired")).await;
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        eprintln!("WordCraft presence cursor update failed: {error}");
+                                        let _ = sender.send(close_message(close_code::ERROR, "presence state is unavailable")).await;
+                                        break;
+                                    }
+                                }
                             }
                             Err(_) => {
                                 let _ = sender.send(close_message(close_code::UNSUPPORTED, "invalid presence JSON message")).await;
@@ -448,7 +574,7 @@ async fn presence_socket(mut socket: WebSocket, state: AppState, document_id: St
                         }
                     }
                     Some(Ok(Message::Binary(_))) => {
-                        let _ = sender.send(close_message(close_code::UNSUPPORTED, "send JSON heartbeat messages only")).await;
+                        let _ = sender.send(close_message(close_code::UNSUPPORTED, "send JSON heartbeat or cursor messages only")).await;
                         break;
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
@@ -2448,7 +2574,15 @@ mod tests {
         assert_eq!(initial["participants"][0]["name"], "Guest 1");
         assert!(uuid::Uuid::parse_str(initial["participants"][0]["id"].as_str().expect("participant id is a string")).is_ok());
 
-        assert!(rooms.heartbeat_at(&session, start + Duration::from_secs(40)).expect("heartbeat refreshes participant"));
+        assert!(rooms.heartbeat_at(&session, start + Duration::from_secs(20)).expect("heartbeat refreshes participant"));
+        let cursor = super::PresenceCursor {
+            anchor: super::PresenceCursorPosition { paragraph: 1, sticky: "AQ==".into() },
+            focus: super::PresenceCursorPosition { paragraph: 2, sticky: "Ag==".into() },
+        };
+        assert!(rooms.set_cursor_at(&session, cursor, start + Duration::from_secs(40)).expect("cursor refreshes participant"));
+        let cursor_roster: serde_json::Value =
+            serde_json::from_str(&session.updates.try_recv().expect("cursor update broadcasts roster")).expect("cursor roster is JSON");
+        assert_eq!(cursor_roster["participants"][0]["cursor"]["anchor"]["paragraph"], 1);
         assert!(session.room.expire_at(start + Duration::from_secs(80)).expect("sweep succeeds").is_none());
         let expired_roster = session
             .room
@@ -2478,6 +2612,28 @@ mod tests {
         assert!(rooms.is_empty().expect("empty room is removed from the registry"));
     }
 
+    #[test]
+    fn presence_cursor_roster_stays_within_client_message_limit() {
+        let sticky = "A".repeat(super::MAX_PRESENCE_STICKY_CHARS);
+        let too_long = "A".repeat(super::MAX_PRESENCE_STICKY_CHARS + 1);
+        assert!(super::is_standard_base64_sticky(&sticky), "the exact sticky limit is accepted");
+        assert!(!super::is_standard_base64_sticky(&too_long), "one character over the sticky limit is rejected");
+
+        let room = super::PresenceRoom::new();
+        let now = super::Instant::now();
+        for _ in 0..super::MAX_PRESENCE_PARTICIPANTS {
+            let (id, _, _) = room.add_at(now).expect("participant joins within room limit");
+            let cursor = super::PresenceCursor {
+                anchor: super::PresenceCursorPosition { paragraph: 255, sticky: sticky.clone() },
+                focus: super::PresenceCursorPosition { paragraph: 255, sticky: sticky.clone() },
+            };
+            let cursor = super::validate_presence_cursor(cursor).expect("maximum cursor is valid");
+            room.set_cursor_at(&id, cursor, now).expect("cursor updates").expect("participant remains in room");
+        }
+        let roster = room.snapshot().expect("full cursor roster encodes");
+        assert!(roster.len() <= super::MAX_PRESENCE_ROSTER_BYTES, "roster is {} bytes", roster.len());
+    }
+
     #[tokio::test]
     async fn presence_websocket_roster_tracks_join_heartbeat_and_leave_without_persistence() {
         let path = test_path("presence-roster");
@@ -2490,13 +2646,23 @@ mod tests {
         let url = format!("{base}/api/documents/{}/presence", created.summary.id);
 
         let (mut alice, _) = tokio_tungstenite::connect_async(&url).await.expect("Alice joins presence room");
+        let alice_session: serde_json::Value = serde_json::from_str(&next_client_text(&mut alice).await).expect("Alice session is JSON");
+        assert_eq!(alice_session["kind"], "session");
+        let alice_id = alice_session["id"].as_str().expect("server assigns Alice a session id").to_string();
+        assert!(uuid::Uuid::parse_str(&alice_id).is_ok());
         let alice_join: serde_json::Value = serde_json::from_str(&next_client_text(&mut alice).await).expect("Alice roster is JSON");
         assert_eq!(alice_join["kind"], "roster");
         let alice_entry = alice_join["participants"].as_array().expect("roster participants array").first().expect("Alice is listed").clone();
-        let alice_id = alice_entry["id"].as_str().expect("server assigns a participant id").to_string();
+        assert_eq!(alice_entry["id"], alice_id, "the targeted session id matches Alice's roster entry");
+        assert!(alice_entry["cursor"].is_null());
         assert_eq!(alice_entry["name"], "Guest 1");
 
         let (mut bob, _) = tokio_tungstenite::connect_async(&url).await.expect("Bob joins presence room");
+        let bob_session: serde_json::Value = serde_json::from_str(&next_client_text(&mut bob).await).expect("Bob session is JSON");
+        assert_eq!(bob_session["kind"], "session");
+        let bob_id = bob_session["id"].as_str().expect("server assigns Bob a session id").to_string();
+        assert!(uuid::Uuid::parse_str(&bob_id).is_ok());
+        assert_ne!(bob_id, alice_id, "each socket receives its own server-assigned id");
         let bob_join: serde_json::Value = serde_json::from_str(&next_client_text(&mut bob).await).expect("Bob roster is JSON");
         let alice_update: serde_json::Value = serde_json::from_str(&next_client_text(&mut alice).await).expect("Alice receives join roster");
         let bob_entries = bob_join["participants"].as_array().expect("Bob roster participant array");
@@ -2505,7 +2671,33 @@ mod tests {
         assert!(bob_entries.iter().any(|participant| participant["id"] == alice_id));
         let bob_entry = bob_entries.iter().find(|participant| participant["id"] != alice_id).expect("Bob gets a distinct server id");
         assert_ne!(bob_entry["id"], alice_id);
+        assert_eq!(bob_entry["id"], bob_id, "Bob's session id matches his roster entry");
         assert_eq!(bob_entry["name"], "Guest 2");
+
+        let cursor = serde_json::json!({
+            "anchor": {"paragraph": 2, "sticky": "AQID"},
+            "focus": {"paragraph": 5, "sticky": "BAUG"}
+        });
+        bob.send(ClientMessage::Text(serde_json::json!({"kind": "cursor", "anchor": cursor["anchor"], "focus": cursor["focus"]}).to_string().into()))
+            .await
+            .expect("Bob cursor update sends");
+        let bob_cursor_roster: serde_json::Value = serde_json::from_str(&next_client_text(&mut bob).await).expect("Bob receives cursor roster");
+        let alice_cursor_roster: serde_json::Value = serde_json::from_str(&next_client_text(&mut alice).await).expect("Alice receives cursor roster");
+        assert_eq!(alice_cursor_roster["participants"], bob_cursor_roster["participants"], "cursor roster fans out consistently");
+        let bob_cursor = bob_cursor_roster["participants"]
+            .as_array()
+            .expect("cursor roster participants array")
+            .iter()
+            .find(|participant| participant["id"] == bob_id)
+            .expect("Bob appears in cursor roster");
+        assert_eq!(bob_cursor["cursor"], cursor);
+        let alice_cursor = bob_cursor_roster["participants"]
+            .as_array()
+            .expect("cursor roster participants array")
+            .iter()
+            .find(|participant| participant["id"] == alice_id)
+            .expect("Alice appears in cursor roster");
+        assert!(alice_cursor["cursor"].is_null());
 
         bob.send(ClientMessage::Close(None)).await.expect("Bob closes presence socket");
         let alice_leave: serde_json::Value = serde_json::from_str(&next_client_text(&mut alice).await).expect("Alice receives leave roster");
@@ -2521,6 +2713,7 @@ mod tests {
         let stored = store.get(&created.summary.id).expect("document remains available");
         assert_eq!(stored.summary.version, version, "presence does not advance document version");
         assert!(!stored.summary.snapshot_locked, "presence does not seed a collaboration epoch");
+        assert_eq!(stored.snapshot, created.snapshot, "presence does not alter the stored document snapshot");
         let (epoch_count, update_count) = {
             let connection = store.connection().expect("database connection locks");
             let epoch_count: i64 = connection
@@ -2584,12 +2777,35 @@ mod tests {
             ClientMessage::Text("{".into()),
             ClientMessage::Text(r#"{"kind":"cursor"}"#.into()),
             ClientMessage::Text(r#"{"kind":"heartbeat","id":"client-chosen"}"#.into()),
+            ClientMessage::Text(r#"{"kind":"cursor","anchor":{"paragraph":256,"sticky":"AQ=="},"focus":{"paragraph":0,"sticky":"Ag=="}}"#.into()),
+            ClientMessage::Text(r#"{"kind":"cursor","anchor":{"paragraph":-1,"sticky":"AQ=="},"focus":{"paragraph":0,"sticky":"Ag=="}}"#.into()),
+            ClientMessage::Text(r#"{"kind":"cursor","anchor":{"paragraph":0,"sticky":""},"focus":{"paragraph":0,"sticky":"Ag=="}}"#.into()),
+            ClientMessage::Text(r#"{"kind":"cursor","anchor":{"paragraph":0,"sticky":"AQ*="},"focus":{"paragraph":0,"sticky":"Ag=="}}"#.into()),
+            ClientMessage::Text(r#"{"kind":"cursor","anchor":{"paragraph":0,"sticky":"A=Q="},"focus":{"paragraph":0,"sticky":"Ag=="}}"#.into()),
+            ClientMessage::Text(
+                r#"{"kind":"cursor","anchor":{"paragraph":0,"sticky":"AQ==","unknown":true},"focus":{"paragraph":0,"sticky":"Ag=="}}"#.into(),
+            ),
+            ClientMessage::Text(
+                r#"{"kind":"cursor","anchor":{"paragraph":0,"sticky":"AQ=="},"focus":{"paragraph":0,"sticky":"Ag=="},"unknown":true}"#.into(),
+            ),
+            ClientMessage::Text(
+                serde_json::json!({
+                    "kind": "cursor",
+                    "anchor": {"paragraph": 0, "sticky": "A".repeat(super::MAX_PRESENCE_STICKY_CHARS + 1)},
+                    "focus": {"paragraph": 0, "sticky": "Ag=="}
+                })
+                .to_string()
+                .into(),
+            ),
             ClientMessage::Binary(vec![1, 2, 3].into()),
             ClientMessage::Text("x".repeat(super::MAX_PRESENCE_MESSAGE_BYTES + 1).into()),
         ];
         for invalid in invalid_messages {
             let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.expect("presence socket joins");
-            let _ = next_client_text(&mut socket).await;
+            let session: serde_json::Value = serde_json::from_str(&next_client_text(&mut socket).await).expect("session is JSON");
+            assert_eq!(session["kind"], "session");
+            let roster: serde_json::Value = serde_json::from_str(&next_client_text(&mut socket).await).expect("initial roster is JSON");
+            assert_eq!(roster["kind"], "roster");
             socket.send(invalid).await.expect("invalid test frame sends");
             expect_client_closed(&mut socket).await;
         }

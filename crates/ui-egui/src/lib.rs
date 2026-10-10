@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use wordcraft_engine::Session;
 
+pub use canvas::RemoteSelection;
 pub use control::ControlRequest;
 
 /// Platform services injected by the host (file dialogs, file I/O).
