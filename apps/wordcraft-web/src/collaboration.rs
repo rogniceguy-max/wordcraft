@@ -1,7 +1,8 @@
-//! Narrow single-paragraph live text collaboration for the browser editor.
+//! Narrow fixed-structure live text collaboration for the browser editor.
 //!
-//! The adapter intentionally shares only `body:main`. Rich text, structure, and cursor presence
-//! are outside this mode; the ordinary WordCraft `Session` remains the visible editor model.
+//! The adapter shares only a frozen sequence of plain-text body paragraphs. Rich structure and
+//! cursor presence are outside this mode; the ordinary WordCraft `Session` remains the visible
+//! editor model.
 
 use wordcraft_doc::props::Underline;
 use wordcraft_doc::{Block, CharProps, Document, Path, Pos, Run, StoryRef};
@@ -40,6 +41,7 @@ fn undo_timestamp() -> u64 {
 }
 
 const SHARED_TEXT: &str = "body:main";
+const MAX_SHARED_PARAGRAPHS: usize = 256;
 const MAX_SHARED_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const ATTR_BOLD: &str = "wc.bold";
 const ATTR_ITALIC: &str = "wc.italic";
@@ -113,9 +115,16 @@ fn is_current_socket_generation(event_generation: u64, current_generation: u64) 
     event_generation == current_generation
 }
 
-/// True only for a document with one plain-text paragraph and supported direct character styles.
-pub fn supported_body_text(document: &Document) -> Option<String> {
-    if document.body.len() != 1
+#[derive(Clone, Debug, PartialEq)]
+struct SharedParagraph {
+    text: String,
+    runs: Vec<Run>,
+}
+
+/// True only for a document whose fixed body consists of supported plain-text paragraphs.
+fn supported_body(document: &Document) -> Option<Vec<SharedParagraph>> {
+    if document.body.is_empty()
+        || document.body.len() > MAX_SHARED_PARAGRAPHS
         || !document.parts.is_empty()
         || !document.comments.is_empty()
         || !document.revisions.is_empty()
@@ -125,22 +134,33 @@ pub fn supported_body_text(document: &Document) -> Option<String> {
     {
         return None;
     }
-    let Block::Para(paragraph) = &**document.body.first()? else { return None };
-    if paragraph.text.len() > MAX_SHARED_TEXT_BYTES {
-        return None;
+    let mut total_bytes = 0usize;
+    let mut paragraphs = Vec::with_capacity(document.body.len());
+    for block in &document.body {
+        let Block::Para(paragraph) = &**block else { return None };
+        let run_len = paragraph.runs.iter().try_fold(0usize, |total, run| total.checked_add(run.len));
+        if paragraph.props != wordcraft_doc::props::ParaProps::default()
+            || paragraph.mark != CharProps::default()
+            || paragraph.section.is_some()
+            || !paragraph.objects.is_empty()
+            || paragraph.runs.iter().any(|run| !supported_char_props(&run.props))
+            || run_len != Some(paragraph.text.len())
+            || paragraph.text.chars().any(unsupported_text_char)
+        {
+            return None;
+        }
+        total_bytes = total_bytes.checked_add(paragraph.text.len())?;
+        if total_bytes > MAX_SHARED_TEXT_BYTES {
+            return None;
+        }
+        paragraphs.push(SharedParagraph { text: paragraph.text.clone(), runs: paragraph.runs.clone() });
     }
-    let run_len = paragraph.runs.iter().try_fold(0usize, |total, run| total.checked_add(run.len));
-    if paragraph.props != wordcraft_doc::props::ParaProps::default()
-        || paragraph.mark != CharProps::default()
-        || paragraph.section.is_some()
-        || !paragraph.objects.is_empty()
-        || paragraph.runs.iter().any(|run| !supported_char_props(&run.props))
-        || run_len != Some(paragraph.text.len())
-        || paragraph.text.chars().any(unsupported_text_char)
-    {
-        return None;
-    }
-    Some(paragraph.text.clone())
+    Some(paragraphs)
+}
+
+#[cfg(test)]
+fn supported_body_text(document: &Document) -> Option<Vec<String>> {
+    supported_body(document).map(|paragraphs| paragraphs.into_iter().map(|paragraph| paragraph.text).collect())
 }
 
 fn supported_char_props(props: &CharProps) -> bool {
@@ -149,11 +169,8 @@ fn supported_char_props(props: &CharProps) -> bool {
     supported_underline && *props == allowed
 }
 
-fn clear_paragraph_mark(document: &mut Document) -> Result<bool, String> {
-    if document.body.len() != 1 {
-        return Err(scope_error());
-    }
-    let Some(block) = document.body.first_mut() else { return Err(scope_error()) };
+fn clear_paragraph_mark(document: &mut Document, paragraph_index: usize) -> Result<bool, String> {
+    let Some(block) = document.body.get_mut(paragraph_index) else { return Err(scope_error()) };
     let Block::Para(paragraph) = std::sync::Arc::make_mut(block) else { return Err(scope_error()) };
     let changed = paragraph.mark != CharProps::default();
     if changed {
@@ -163,11 +180,11 @@ fn clear_paragraph_mark(document: &mut Document) -> Result<bool, String> {
     Ok(changed)
 }
 
-fn props_for_range(document: &Document, start: usize, end: usize) -> Result<CharProps, String> {
+fn props_for_range(document: &Document, paragraph_index: usize, start: usize, end: usize) -> Result<CharProps, String> {
     if start >= end {
         return Err("A live text insertion must contain at least one character.".into());
     }
-    let Some(Block::Para(paragraph)) = document.body.first().map(|block| &**block) else { return Err(scope_error()) };
+    let Some(Block::Para(paragraph)) = document.body.get(paragraph_index).map(|block| &**block) else { return Err(scope_error()) };
     let mut selected_props = None;
     let mut covered = 0usize;
     for (range, props) in paragraph.run_ranges() {
@@ -221,8 +238,8 @@ fn props_from_attrs(attributes: Option<&Attrs>) -> Result<CharProps, String> {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-fn selection_format_value(document: &Document, id: &str, start: usize, end: usize) -> Result<bool, String> {
-    let Some(Block::Para(paragraph)) = document.body.first().map(|block| &**block) else { return Err(scope_error()) };
+fn selection_format_value(document: &Document, paragraph_index: usize, id: &str, start: usize, end: usize) -> Result<bool, String> {
+    let Some(Block::Para(paragraph)) = document.body.get(paragraph_index).map(|block| &**block) else { return Err(scope_error()) };
     let mut selected_value = None;
     let mut selected_any = false;
     for (range, props) in paragraph.run_ranges() {
@@ -258,15 +275,17 @@ fn unsupported_text_char(ch: char) -> bool {
 
 #[derive(Clone)]
 struct RelativeSelection {
+    anchor_paragraph: usize,
+    focus_paragraph: usize,
     anchor: StickyIndex,
     focus: StickyIndex,
     collapsed: bool,
 }
 
-/// Yrs state and actor-scoped undo for the one shared text sequence.
+/// Yrs state and actor-scoped undo for the fixed set of body text roots.
 struct LiveText {
     doc: Doc,
-    text: TextRef,
+    texts: Vec<TextRef>,
     undo: Option<UndoManager<()>>,
 }
 
@@ -276,53 +295,64 @@ struct FullStateResult {
     local_state_acknowledged: bool,
 }
 
+fn shared_text_root(paragraph_index: usize) -> String {
+    if paragraph_index == 0 { SHARED_TEXT.to_string() } else { format!("body:paragraph:{paragraph_index}") }
+}
+
+fn paragraph_from_shared_text<T: ReadTxn>(text: &TextRef, transaction: &T) -> Result<SharedParagraph, String> {
+    let mut value = String::new();
+    let mut runs: Vec<Run> = Vec::new();
+    for chunk in text.diff(transaction, YChange::identity) {
+        let Out::Any(Any::String(chunk_text)) = chunk.insert else {
+            return Err("Live text supports plain text only; embedded objects are blocked.".into());
+        };
+        let chunk_text = chunk_text.as_ref();
+        if chunk_text.chars().any(unsupported_text_char) {
+            return Err(scope_error());
+        }
+        let props = props_from_attrs(chunk.attributes.as_deref())?;
+        if !chunk_text.is_empty() {
+            if let Some(last) = runs.last_mut().filter(|last| last.props == props) {
+                last.len = last.len.saturating_add(chunk_text.len());
+            } else {
+                runs.push(Run { len: chunk_text.len(), props });
+            }
+            value.push_str(chunk_text);
+        }
+    }
+    Ok(SharedParagraph { text: value, runs })
+}
+
 impl LiveText {
-    fn new() -> Self {
+    fn with_paragraph_count(paragraph_count: usize) -> Result<Self, String> {
+        if !(1..=MAX_SHARED_PARAGRAPHS).contains(&paragraph_count) {
+            return Err(scope_error());
+        }
         // Yrs Bytes mode makes StickyIndex mix UTF-8 byte lengths with internal item clocks
         // for multibyte text. UTF-16 mode keeps relative positions consistent; edit offsets
         // are converted at the adapter boundary from WordCraft's UTF-8 byte positions.
         let doc = Doc::with_options(DocOptions { offset_kind: OffsetKind::Utf16, ..DocOptions::default() });
-        let text = doc.get_or_insert_text(SHARED_TEXT);
-        LiveText { doc, text, undo: None }
+        let texts = (0..paragraph_count).map(|index| doc.get_or_insert_text(shared_text_root(index))).collect();
+        Ok(LiveText { doc, texts, undo: None })
     }
 
-    fn text(&self) -> String {
-        self.text.get_string(&self.doc.transact())
+    fn paragraph_text(&self, paragraph_index: usize) -> Result<String, String> {
+        let text = self.texts.get(paragraph_index).ok_or_else(scope_error)?;
+        Ok(text.get_string(&self.doc.transact()))
     }
 
-    fn shared_text_and_runs(&self) -> Result<(String, Vec<Run>), String> {
+    fn body_texts(&self) -> Result<Vec<String>, String> {
+        Ok(self.shared_paragraphs()?.into_iter().map(|paragraph| paragraph.text).collect())
+    }
+
+    fn shared_paragraphs(&self) -> Result<Vec<SharedParagraph>, String> {
         let transaction = self.doc.transact();
-        let mut value = String::new();
-        let mut runs: Vec<Run> = Vec::new();
-        for chunk in self.text.diff(&transaction, YChange::identity) {
-            let Out::Any(Any::String(chunk_text)) = chunk.insert else {
-                return Err("Live text supports plain text only; embedded objects are blocked.".into());
-            };
-            let chunk_text = chunk_text.as_ref();
-            if chunk_text.chars().any(unsupported_text_char) {
-                return Err(scope_error());
-            }
-            let props = props_from_attrs(chunk.attributes.as_deref())?;
-            if !chunk_text.is_empty() {
-                if let Some(last) = runs.last_mut().filter(|last| last.props == props) {
-                    last.len = last.len.saturating_add(chunk_text.len());
-                } else {
-                    runs.push(Run { len: chunk_text.len(), props });
-                }
-                value.push_str(chunk_text);
-            }
-        }
-        if value.len() > MAX_SHARED_TEXT_BYTES {
-            return Err(scope_error());
-        }
-        Ok((value, runs))
+        self.texts.iter().map(|text| paragraph_from_shared_text(text, &transaction)).collect()
     }
 
     fn editor_matches_shared(&self, document: &Document) -> Result<bool, String> {
-        let Some(editor_text) = supported_body_text(document) else { return Ok(false) };
-        let (shared_text, shared_runs) = self.shared_text_and_runs()?;
-        let Block::Para(paragraph) = &**document.body.first().ok_or_else(scope_error)? else { return Ok(false) };
-        Ok(editor_text == shared_text && paragraph.runs == shared_runs)
+        let Some(editor_paragraphs) = supported_body(document) else { return Ok(false) };
+        Ok(editor_paragraphs == self.shared_paragraphs()?)
     }
 
     fn state_vector(&self) -> StateVector {
@@ -334,14 +364,19 @@ impl LiveText {
     fn apply_full_state(&mut self, session: &mut Session, bytes: &[u8]) -> Result<FullStateResult, String> {
         let server_update = Update::decode_v1(bytes).map_err(|error| format!("invalid live text update: {error}"))?;
         let server_doc = Doc::new();
-        let server_text = server_doc.get_or_insert_text(SHARED_TEXT);
+        let server_texts: Vec<TextRef> = (0..self.texts.len()).map(|index| server_doc.get_or_insert_text(shared_text_root(index))).collect();
         server_doc.transact_mut().apply_update(server_update).map_err(|error| format!("could not read live text state: {error}"))?;
-        let server_value = server_text.get_string(&server_doc.transact());
-        validate_shared_text(&server_value)?;
+        let server_paragraphs = {
+            let transaction = server_doc.transact();
+            server_texts.iter().map(|text| paragraph_from_shared_text(text, &transaction)).collect::<Result<Vec<_>, _>>()?
+        };
+        validate_shared_paragraphs(&server_paragraphs)?;
 
-        let editor_value = supported_body_text(&session.doc).ok_or_else(scope_error)?;
-        let local_value = self.text();
-        if local_value.is_empty() && !editor_value.is_empty() && server_value.is_empty() {
+        let editor_paragraphs = supported_body(&session.doc).ok_or_else(scope_error)?;
+        if self.body_texts()?.iter().all(String::is_empty)
+            && editor_paragraphs.iter().any(|paragraph| !paragraph.text.is_empty())
+            && server_paragraphs.iter().all(|paragraph| paragraph.text.is_empty())
+        {
             return Err(
                 "The server has no seeded live text for this document. Your editor content was kept; save or resolve the document before joining."
                     .into(),
@@ -351,10 +386,10 @@ impl LiveText {
 
         let local_update = Update::decode_v1(bytes).map_err(|error| format!("invalid live text update: {error}"))?;
         self.doc.transact_mut().apply_update(local_update).map_err(|error| format!("could not apply live text state: {error}"))?;
-        let merged_value = self.text();
-        validate_shared_text(&merged_value)?;
-        if merged_value != editor_value || !self.editor_matches_shared(&session.doc)? {
-            self.project_text(session, &merged_value, old_anchors, session.sel.clone())?;
+        let merged_paragraphs = self.shared_paragraphs()?;
+        validate_shared_paragraphs(&merged_paragraphs)?;
+        if merged_paragraphs != editor_paragraphs || !self.editor_matches_shared(&session.doc)? {
+            self.project_body(session, &merged_paragraphs, old_anchors, session.sel.clone())?;
         }
         if self.undo.is_none() {
             self.initialize_undo();
@@ -369,65 +404,89 @@ impl LiveText {
 
     fn apply_remote_update(&mut self, session: &mut Session, bytes: &[u8]) -> Result<bool, String> {
         let update = Update::decode_v1(bytes).map_err(|error| format!("invalid live text update: {error}"))?;
-        let before = supported_body_text(&session.doc).ok_or_else(scope_error)?;
+        let before = supported_body(&session.doc).ok_or_else(scope_error)?;
         if !self.editor_matches_shared(&session.doc)? {
             return Err("The editor and live text are out of sync. Editing was paused to protect the document.".into());
         }
         let anchors = self.capture_selection(session)?;
         self.doc.transact_mut().apply_update(update).map_err(|error| format!("could not apply live text update: {error}"))?;
-        let after = self.text();
-        validate_shared_text(&after)?;
+        let after = self.shared_paragraphs()?;
+        validate_shared_paragraphs(&after)?;
         if after == before && self.editor_matches_shared(&session.doc)? {
             return Ok(false);
         }
-        self.project_text(session, &after, Some(anchors), session.sel.clone())?;
+        self.project_body(session, &after, Some(anchors), session.sel.clone())?;
         Ok(true)
     }
 
-    /// Diff the editor's completed single-paragraph command into one Yrs delete/insert transaction.
-    fn apply_local_editor_change(&mut self, session: &mut Session, before: &str) -> Result<Option<Vec<u8>>, String> {
-        let after = supported_body_text(&session.doc).ok_or_else(scope_error)?;
-        let shared_before = self.text();
-        if shared_before != before {
+    /// Diff one paragraph's completed editor command into one Yrs delete/insert transaction.
+    fn apply_local_editor_change(
+        &mut self,
+        session: &mut Session,
+        before: &[SharedParagraph],
+        paragraph_index: usize,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let after = supported_body(&session.doc).ok_or_else(scope_error)?;
+        if before.len() != self.texts.len() || after.len() != before.len() || paragraph_index >= before.len() {
+            return Err("Live text paragraph structure is fixed while collaboration is active.".into());
+        }
+        if self.shared_paragraphs()? != before {
             return Err("The editor is catching up with live text. The attempted edit was reverted; retry when the live session is ready.".into());
         }
-        let Some((start, old_end, inserted)) = one_splice(before, &after) else {
+        if before.iter().zip(&after).enumerate().any(|(index, (old, new))| index != paragraph_index && old != new) {
+            return Err("Live text edits must stay inside one body paragraph; the attempted structural edit was reverted.".into());
+        }
+        let before_paragraph = before.get(paragraph_index).ok_or_else(scope_error)?;
+        let after_paragraph = after.get(paragraph_index).ok_or_else(scope_error)?;
+        let Some((start, old_end, inserted)) = one_splice(&before_paragraph.text, &after_paragraph.text) else {
+            if before_paragraph != after_paragraph {
+                return Err("A live text command changed character formatting unexpectedly; the edit was reverted.".into());
+            }
             session.reset_history();
             return Ok(None);
         };
         let inserted_end = start.checked_add(inserted.len()).ok_or_else(scope_error)?;
-        if !before.is_char_boundary(start)
-            || !before.is_char_boundary(old_end)
-            || !after.is_char_boundary(start)
-            || !after.is_char_boundary(inserted_end)
+        if !before_paragraph.text.is_char_boundary(start)
+            || !before_paragraph.text.is_char_boundary(old_end)
+            || !after_paragraph.text.is_char_boundary(start)
+            || !after_paragraph.text.is_char_boundary(inserted_end)
         {
             return Err("The text edit did not fall on a UTF-8 character boundary.".into());
         }
-        let insert_attributes = if inserted.is_empty() { None } else { Some(attrs_from_props(&props_for_range(&session.doc, start, inserted_end)?)) };
-        let start_utf16 = byte_to_utf16_offset(before, start)?;
-        let old_end_utf16 = byte_to_utf16_offset(before, old_end)?;
+        let insert_attributes =
+            if inserted.is_empty() { None } else { Some(attrs_from_props(&props_for_range(&session.doc, paragraph_index, start, inserted_end)?)) };
+        let start_utf16 = byte_to_utf16_offset(&before_paragraph.text, start)?;
+        let old_end_utf16 = byte_to_utf16_offset(&before_paragraph.text, old_end)?;
         let remove_len = old_end_utf16.saturating_sub(start_utf16);
         let prior_state = self.state_vector();
+        let text = self.texts.get(paragraph_index).ok_or_else(scope_error)?;
         {
             let mut transaction = self.doc.transact_mut_with(self.doc.client_id());
             if remove_len > 0 {
-                self.text.remove_range(&mut transaction, start_utf16, remove_len);
+                text.remove_range(&mut transaction, start_utf16, remove_len);
             }
             if let Some(attributes) = insert_attributes {
-                self.text.insert_with_attributes(&mut transaction, start_utf16, inserted, attributes);
+                text.insert_with_attributes(&mut transaction, start_utf16, inserted, attributes);
             }
         }
-        let shared_after = self.text();
-        validate_shared_text(&shared_after)?;
+        let shared_after = self.shared_paragraphs()?;
+        validate_shared_paragraphs(&shared_after)?;
         session.reset_history();
         if shared_after != after || !self.editor_matches_shared(&session.doc)? {
-            self.project_text(session, &shared_after, None, session.sel.clone())?;
+            self.project_body(session, &shared_after, None, session.sel.clone())?;
         }
         if shared_after == before { Ok(None) } else { Ok(Some(self.doc.transact().encode_state_as_update_v1(&prior_state))) }
     }
 
-    fn apply_format_update(&mut self, id: &str, start_byte: usize, end_byte: usize, value: bool) -> Result<Option<Vec<u8>>, String> {
-        let current = self.text();
+    fn apply_format_update(
+        &mut self,
+        paragraph_index: usize,
+        id: &str,
+        start_byte: usize,
+        end_byte: usize,
+        value: bool,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let current = self.paragraph_text(paragraph_index)?;
         if start_byte >= end_byte {
             return Err("Live formatting requires a non-empty selection.".into());
         }
@@ -440,38 +499,39 @@ impl LiveText {
             _ => return Err("Unsupported live formatting command.".into()),
         };
         let prior_state = self.state_vector();
+        let text = self.texts.get(paragraph_index).ok_or_else(scope_error)?;
         let mut attributes = Attrs::new();
         attributes.insert(std::sync::Arc::from(attribute), Any::Bool(value));
         {
             let mut transaction = self.doc.transact_mut_with(self.doc.client_id());
-            self.text.format(&mut transaction, start, end - start, attributes);
+            text.format(&mut transaction, start, end - start, attributes);
         }
-        if self.text() != current {
+        if self.paragraph_text(paragraph_index)? != current {
             return Err("A live formatting update changed the paragraph text.".into());
         }
         if self.state_vector() == prior_state { Ok(None) } else { Ok(Some(self.doc.transact().encode_state_as_update_v1(&prior_state))) }
     }
 
     fn undo_or_redo(&mut self, session: &mut Session, redo: bool) -> Result<Option<Vec<u8>>, String> {
-        let current = supported_body_text(&session.doc).ok_or_else(scope_error)?;
-        if current != self.text() || !self.editor_matches_shared(&session.doc)? {
+        let current = supported_body(&session.doc).ok_or_else(scope_error)?;
+        if current != self.shared_paragraphs()? || !self.editor_matches_shared(&session.doc)? {
             return Err("The editor is catching up with live text. Undo was paused to protect the document.".into());
         }
         let anchors = self.capture_selection(session)?;
-        let prior_shared = self.shared_text_and_runs()?;
+        let prior_shared = self.shared_paragraphs()?;
         let prior_state = self.state_vector();
         let undo = self.undo.as_mut().ok_or_else(|| "Live undo is not ready yet.".to_string())?;
         let changed = if redo { undo.redo_blocking() } else { undo.undo_blocking() };
         if !changed {
             return Ok(None);
         }
-        let updated = self.text();
-        validate_shared_text(&updated)?;
+        let updated = self.shared_paragraphs()?;
+        validate_shared_paragraphs(&updated)?;
         if updated != current || !self.editor_matches_shared(&session.doc)? {
-            self.project_text(session, &updated, Some(anchors), session.sel.clone())?;
+            self.project_body(session, &updated, Some(anchors), session.sel.clone())?;
         }
         session.reset_history();
-        if self.shared_text_and_runs()? == prior_shared { Ok(None) } else { Ok(Some(self.doc.transact().encode_state_as_update_v1(&prior_state))) }
+        if self.shared_paragraphs()? == prior_shared { Ok(None) } else { Ok(Some(self.doc.transact().encode_state_as_update_v1(&prior_state))) }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -486,26 +546,23 @@ impl LiveText {
 
     fn initialize_undo(&mut self) {
         let mut undo = UndoManager::<()>::with_options(undo_options());
-        undo.expand_scope(&self.doc, &self.text);
+        for text in &self.texts {
+            undo.expand_scope(&self.doc, text);
+        }
         undo.include_origin(self.doc.client_id());
         self.undo = Some(undo);
     }
 
     fn capture_selection(&self, session: &Session) -> Result<RelativeSelection, String> {
-        let current = self.text();
-        if supported_body_text(&session.doc).as_deref() != Some(current.as_str()) {
+        if supported_body(&session.doc).as_deref() != Some(self.shared_paragraphs()?.as_slice()) {
             return Err("The editor and live text are out of sync.".into());
         }
         let selection = &session.sel;
-        if selection.anchor.story != StoryRef::Body
-            || selection.focus.story != StoryRef::Body
-            || selection.anchor.path != Path::top(0)
-            || selection.focus.path != Path::top(0)
-        {
-            return Err("Live editing supports a caret or selection in the single body paragraph only.".into());
-        }
-        let anchor = checked_offset(&current, selection.anchor.off)?;
-        let focus = checked_offset(&current, selection.focus.off)?;
+        let anchor_paragraph = selection_paragraph_index(&selection.anchor, self.texts.len())?;
+        let focus_paragraph = selection_paragraph_index(&selection.focus, self.texts.len())?;
+        let paragraphs = self.shared_paragraphs()?;
+        let anchor = checked_offset(&paragraphs[anchor_paragraph].text, selection.anchor.off)?;
+        let focus = checked_offset(&paragraphs[focus_paragraph].text, selection.focus.off)?;
         let transaction = self.doc.transact();
         let anchor_assoc = if selection.is_collapsed() {
             Assoc::After
@@ -515,49 +572,67 @@ impl LiveText {
             Assoc::After
         };
         let focus_assoc = if selection.is_collapsed() || selection.anchor <= selection.focus { Assoc::After } else { Assoc::Before };
-        let anchor = sticky_index(&self.text, &transaction, anchor, anchor_assoc)?;
-        let focus = if selection.is_collapsed() { anchor.clone() } else { sticky_index(&self.text, &transaction, focus, focus_assoc)? };
-        Ok(RelativeSelection { anchor, focus, collapsed: selection.is_collapsed() })
+        let anchor_text = self.texts.get(anchor_paragraph).ok_or_else(scope_error)?;
+        let focus_text = self.texts.get(focus_paragraph).ok_or_else(scope_error)?;
+        let anchor = sticky_index(anchor_text, &transaction, anchor, anchor_assoc)?;
+        let focus = if selection.is_collapsed() { anchor.clone() } else { sticky_index(focus_text, &transaction, focus, focus_assoc)? };
+        Ok(RelativeSelection { anchor_paragraph, focus_paragraph, anchor, focus, collapsed: selection.is_collapsed() })
     }
 
-    fn project_text(&self, session: &mut Session, value: &str, anchors: Option<RelativeSelection>, fallback: Selection) -> Result<(), String> {
-        validate_shared_text(value)?;
-        if supported_body_text(&session.doc).is_none() {
+    fn project_body(
+        &self,
+        session: &mut Session,
+        paragraphs: &[SharedParagraph],
+        anchors: Option<RelativeSelection>,
+        fallback: Selection,
+    ) -> Result<(), String> {
+        validate_shared_paragraphs(paragraphs)?;
+        if paragraphs.len() != self.texts.len() || supported_body(&session.doc).is_none() {
             return Err(scope_error());
         }
         let resolved_selection = if let Some(anchors) = anchors {
             let transaction = self.doc.transact();
-            let anchor = resolve_sticky(&anchors.anchor, &transaction, value)?;
-            let focus = if anchors.collapsed { anchor } else { resolve_sticky(&anchors.focus, &transaction, value)? };
-            Some(Selection { anchor: Pos::body(0, anchor), focus: Pos::body(0, focus) })
+            let anchor_text = paragraphs.get(anchors.anchor_paragraph).ok_or_else(scope_error)?;
+            let focus_text = paragraphs.get(anchors.focus_paragraph).ok_or_else(scope_error)?;
+            let anchor = resolve_sticky(&anchors.anchor, &transaction, &anchor_text.text)?;
+            let focus = if anchors.collapsed { anchor } else { resolve_sticky(&anchors.focus, &transaction, &focus_text.text)? };
+            Some(Selection { anchor: Pos::body(anchors.anchor_paragraph, anchor), focus: Pos::body(anchors.focus_paragraph, focus) })
         } else {
             None
         };
-        let (shared_value, shared_runs) = self.shared_text_and_runs()?;
-        if shared_value != value {
+        if self.shared_paragraphs()? != paragraphs {
             return Err("The live text body and formatting are out of sync. Editing was paused to protect the document.".into());
         }
-        let paragraph = session.doc.para_mut(StoryRef::Body, &Path::top(0)).map_err(|error| error.to_string())?;
-        let len = paragraph.len();
-        paragraph.delete(0, len).map_err(|error| error.to_string())?;
-        let mut offset = 0usize;
-        for run in shared_runs {
-            let end = offset.checked_add(run.len).ok_or_else(scope_error)?;
-            let chunk = value.get(offset..end).ok_or_else(scope_error)?;
-            if !chunk.is_empty() {
-                paragraph.insert_text(offset, chunk, &run.props).map_err(|error| error.to_string())?;
+        for (paragraph_index, shared) in paragraphs.iter().enumerate() {
+            let unchanged =
+                session.doc.body.get(paragraph_index).and_then(|block| block.as_para()).is_some_and(|paragraph| {
+                    paragraph.text == shared.text && paragraph.runs == shared.runs && paragraph.mark == CharProps::default()
+                });
+            if unchanged {
+                continue;
             }
-            offset = end;
+            let paragraph = session.doc.para_mut(StoryRef::Body, &Path::top(paragraph_index)).map_err(|error| error.to_string())?;
+            let len = paragraph.len();
+            paragraph.delete(0, len).map_err(|error| error.to_string())?;
+            let mut offset = 0usize;
+            for run in &shared.runs {
+                let end = offset.checked_add(run.len).ok_or_else(scope_error)?;
+                let chunk = shared.text.get(offset..end).ok_or_else(scope_error)?;
+                if !chunk.is_empty() {
+                    paragraph.insert_text(offset, chunk, &run.props).map_err(|error| error.to_string())?;
+                }
+                offset = end;
+            }
+            if offset != shared.text.len() {
+                return Err("The live text run lengths do not match a body paragraph.".into());
+            }
+            paragraph.mark = CharProps::default();
+            paragraph.touch();
         }
-        if offset != value.len() {
-            return Err("The live text run lengths do not match the paragraph body.".into());
-        }
-        paragraph.mark = CharProps::default();
-        paragraph.touch();
         if let Some(selection) = resolved_selection {
             session.sel = selection;
         } else {
-            session.sel = Selection { anchor: clamp_offset(value, fallback.anchor.off), focus: clamp_offset(value, fallback.focus.off) };
+            session.sel = Selection { anchor: clamp_position(paragraphs, &fallback.anchor), focus: clamp_position(paragraphs, &fallback.focus) };
         }
         session.clamp_selection();
         session.reset_history();
@@ -567,15 +642,42 @@ impl LiveText {
     }
 }
 
-fn validate_shared_text(value: &str) -> Result<(), String> {
-    if value.len() > MAX_SHARED_TEXT_BYTES {
-        Err("Live text is limited to 8 MiB per document. The update was rejected to protect the document.".into())
-    } else if value.chars().any(unsupported_text_char) {
-        Err("This live session supports plain text in one paragraph. Paragraph breaks, inline objects, and control characters are not supported."
-            .into())
-    } else {
-        Ok(())
+fn validate_shared_paragraphs(paragraphs: &[SharedParagraph]) -> Result<(), String> {
+    if !(1..=MAX_SHARED_PARAGRAPHS).contains(&paragraphs.len()) {
+        return Err(scope_error());
     }
+    let mut total_bytes = 0usize;
+    for paragraph in paragraphs {
+        total_bytes =
+            total_bytes.checked_add(paragraph.text.len()).ok_or_else(|| "Live text exceeds the 8 MiB combined document limit.".to_string())?;
+        if paragraph.text.chars().any(unsupported_text_char) {
+            return Err("This live session supports plain text only. Inline objects and control characters are not supported.".into());
+        }
+    }
+    if total_bytes > MAX_SHARED_TEXT_BYTES {
+        return Err("Live text is limited to 8 MiB across all body paragraphs. The update was rejected to protect the document.".into());
+    }
+    Ok(())
+}
+
+fn selection_paragraph_index(pos: &Pos, paragraph_count: usize) -> Result<usize, String> {
+    if pos.story != StoryRef::Body || pos.path.0.len() != 1 {
+        return Err("Live editing supports selections in top-level body paragraphs only.".into());
+    }
+    let index = pos.path.last();
+    if index >= paragraph_count || pos.path != Path::top(index) {
+        return Err("Live editing supports selections in the fixed body paragraphs only.".into());
+    }
+    Ok(index)
+}
+
+fn selected_paragraph_index(selection: &Selection, paragraph_count: usize) -> Result<usize, String> {
+    let anchor = selection_paragraph_index(&selection.anchor, paragraph_count)?;
+    let focus = selection_paragraph_index(&selection.focus, paragraph_count)?;
+    if anchor != focus {
+        return Err("Live editing and formatting must stay inside one body paragraph.".into());
+    }
+    Ok(anchor)
 }
 
 fn checked_offset(text: &str, offset: usize) -> Result<u32, String> {
@@ -638,12 +740,19 @@ fn utf16_to_byte_offset(text: &str, utf16_offset: u32) -> usize {
     text.len()
 }
 
-fn clamp_offset(text: &str, offset: usize) -> Pos {
+fn clamp_offset(text: &str, offset: usize) -> usize {
     let mut offset = offset.min(text.len());
     while offset > 0 && !text.is_char_boundary(offset) {
         offset -= 1;
     }
-    Pos::body(0, offset)
+    offset
+}
+
+fn clamp_position(paragraphs: &[SharedParagraph], pos: &Pos) -> Pos {
+    if let Ok(index) = selection_paragraph_index(pos, paragraphs.len()) {
+        return Pos::body(index, clamp_offset(&paragraphs[index].text, pos.off));
+    }
+    Pos::body(0, 0)
 }
 
 fn one_splice<'a>(before: &str, after: &'a str) -> Option<(usize, usize, &'a str)> {
@@ -670,7 +779,74 @@ fn one_splice<'a>(before: &str, after: &'a str) -> Option<(usize, usize, &'a str
 }
 
 fn scope_error() -> String {
-    "Live editing is limited to one body paragraph up to 8 MiB, with plain text plus bold, italic, and single underline on selected text. Save or open a supported document first.".into()
+    "Live editing is limited to 1–256 fixed top-level body paragraphs, 8 MiB combined, with plain text plus bold, italic, and single underline on selected text. Save or open a supported document first.".into()
+}
+
+fn restore_editor(session: &mut Session, document: Document, selection: Selection) {
+    session.doc = document;
+    session.sel = selection;
+    session.reset_history();
+    session.touch();
+    session.relayout();
+}
+
+fn apply_local_text_command(
+    adapter: &mut LiveText,
+    session: &mut Session,
+    id: &str,
+    params: &serde_json::Value,
+) -> Result<(serde_json::Value, Option<Vec<u8>>, bool), String> {
+    let current = supported_body(&session.doc).ok_or_else(scope_error)?;
+    let paragraph_index = selected_paragraph_index(&session.sel, current.len())?;
+    if adapter.shared_paragraphs()? != current || !adapter.editor_matches_shared(&session.doc)? {
+        return Err("The editor is catching up with live text. Wait for the update before typing.".into());
+    }
+    let paragraph_text = current.get(paragraph_index).ok_or_else(scope_error)?.text.as_str();
+    if session.sel.is_collapsed()
+        && ((id == "text.backspace" && session.sel.focus.off == 0 && paragraph_index > 0)
+            || (id == "text.delete" && session.sel.focus.off == paragraph_text.len() && paragraph_index + 1 < current.len()))
+    {
+        return Err("Paragraph merging is disabled during live collaboration.".into());
+    }
+    let before_document = session.doc.clone();
+    let before_selection = session.sel.clone();
+    let mut command_params = params.clone();
+    if id == "text.insert" {
+        if let Some(text) = params.get("text").and_then(serde_json::Value::as_str)
+            && text.chars().any(unsupported_text_char)
+        {
+            return Err("Paragraph breaks and control characters are blocked during live collaboration.".into());
+        }
+        if let Some(object) = command_params.as_object_mut() {
+            object.insert("raw".into(), serde_json::Value::Bool(true));
+        }
+    }
+    let result = match session.run(id, &command_params) {
+        Ok(result) => result,
+        Err(error) => {
+            restore_editor(session, before_document, before_selection);
+            return Err(error.to_string());
+        }
+    };
+    let paragraph_mark_cleared = match clear_paragraph_mark(&mut session.doc, paragraph_index) {
+        Ok(cleared) => cleared,
+        Err(error) => {
+            restore_editor(session, before_document, before_selection);
+            return Err(error);
+        }
+    };
+    let update = match adapter.apply_local_editor_change(session, &current, paragraph_index) {
+        Ok(update) => update,
+        Err(error) => {
+            restore_editor(session, before_document, before_selection);
+            return Err(error);
+        }
+    };
+    if paragraph_mark_cleared {
+        session.touch();
+        session.relayout();
+    }
+    Ok((result, update, paragraph_mark_cleared))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -936,7 +1112,7 @@ impl CollaborationBridge {
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.label("Scope: one body paragraph with plain text, bold, italic, and single underline on selected text. Other formatting, paste, paragraph breaks, and structure changes are blocked.");
+                ui.label("Scope: 1–256 fixed body paragraphs with plain text, bold, italic, and single underline on selected text. Editing and formatting stay inside one paragraph; paragraph structure is fixed.");
                 ui.small("Text and selected-format changes are durably saved as live updates. Version history does not include live edits; restore is disabled. No shared cursors or presence are provided.");
                 ui.separator();
                 ui.label(status);
@@ -1005,19 +1181,28 @@ impl CollaborationBridge {
             }
             return;
         }
-        if supported_body_text(&session.doc).is_none() {
+        let Some(paragraph_count) = supported_body(&session.doc).map(|paragraphs| paragraphs.len()) else {
             if let Ok(mut state) = self.inner.try_borrow_mut() {
                 state.status = scope_error();
             }
             return;
-        }
+        };
         if document_id.is_empty() {
             return;
         }
+        let adapter = match LiveText::with_paragraph_count(paragraph_count) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                if let Ok(mut state) = self.inner.try_borrow_mut() {
+                    state.status = error;
+                }
+                return;
+            }
+        };
         session.reset_history();
         if let Ok(mut state) = self.inner.try_borrow_mut() {
             if state.phase == ConnectionPhase::Inactive || state.document_id.as_deref() != Some(document_id.as_str()) {
-                state.adapter = Some(LiveText::new());
+                state.adapter = Some(adapter);
                 state.first_state_received = false;
             }
             state.reconnect.start();
@@ -1223,11 +1408,11 @@ impl BridgeState {
             }
             return Some(self.local_text_command(session, id, params));
         }
-        let Some(spec) = session.registry.get(id) else { return None };
+        let spec = session.registry.get(id)?;
         if !spec.mutates {
             return None;
         }
-        Some(Err("This live session supports plain text plus bold, italic, and single underline on a selection. Paste, paragraph breaks, and document structure changes are blocked.".into()))
+        Some(Err("This live session supports plain text plus bold, italic, and single underline on a selection inside one of the fixed body paragraphs. Paste, paragraph breaks, and document structure changes are blocked.".into()))
     }
 
     fn local_format_command(&mut self, session: &mut Session, id: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -1240,18 +1425,17 @@ impl BridgeState {
         {
             return Err("Live text supports single underline only.".into());
         }
-        let before = supported_body_text(&session.doc).ok_or_else(scope_error)?;
-        if !self
-            .adapter
-            .as_ref()
-            .ok_or_else(|| "Live text state is unavailable. Reconnect to continue.".to_string())?
-            .editor_matches_shared(&session.doc)?
-        {
+        let before = supported_body(&session.doc).ok_or_else(scope_error)?;
+        let paragraph_index = selected_paragraph_index(&session.sel, before.len())?;
+        let Some(adapter) = self.adapter.as_ref() else {
+            return Err("Live text state is unavailable. Reconnect to continue.".into());
+        };
+        if !adapter.editor_matches_shared(&session.doc)? {
             return Err("The editor is catching up with live text. Formatting was paused to protect the document.".into());
         }
         let (start, end) = session.sel.ordered();
-        if start.story != StoryRef::Body || end.story != StoryRef::Body || start.path != Path::top(0) || end.path != Path::top(0) || start == end {
-            return Err("Live formatting supports a non-empty selection in the body paragraph only.".into());
+        if start == end {
+            return Err("Live formatting supports a non-empty selection in one body paragraph only.".into());
         }
         let before_document = session.doc.clone();
         let before_selection = session.sel.clone();
@@ -1262,7 +1446,7 @@ impl BridgeState {
                 return Err(error.to_string());
             }
         };
-        if let Err(error) = clear_paragraph_mark(&mut session.doc) {
+        if let Err(error) = clear_paragraph_mark(&mut session.doc, paragraph_index) {
             session.doc = before_document;
             session.sel = before_selection;
             session.reset_history();
@@ -1270,7 +1454,15 @@ impl BridgeState {
             session.relayout();
             return Err(error);
         }
-        if supported_body_text(&session.doc).as_deref() != Some(before.as_str()) {
+        let after = supported_body(&session.doc);
+        if after.as_ref().is_none_or(|after| {
+            after.len() != before.len()
+                || after
+                    .iter()
+                    .zip(&before)
+                    .enumerate()
+                    .any(|(index, (current, original))| if index == paragraph_index { current.text != original.text } else { current != original })
+        }) {
             session.doc = before_document;
             session.sel = before_selection;
             session.reset_history();
@@ -1278,7 +1470,7 @@ impl BridgeState {
             session.relayout();
             return Err("Live formatting changed the body text unexpectedly; the edit was reverted.".into());
         }
-        let formatted = match selection_format_value(&session.doc, id, start.off, end.off) {
+        let formatted = match selection_format_value(&session.doc, paragraph_index, id, start.off, end.off) {
             Ok(value) => value,
             Err(error) => {
                 session.doc = before_document;
@@ -1290,7 +1482,7 @@ impl BridgeState {
             }
         };
         let adapter = self.adapter.as_mut().ok_or_else(|| "Live text state is unavailable. Reconnect to continue.".to_string())?;
-        let update = match adapter.apply_format_update(id, start.off, end.off, formatted) {
+        let update = match adapter.apply_format_update(paragraph_index, id, start.off, end.off, formatted) {
             Ok(update) => update,
             Err(error) => {
                 session.doc = before_document;
@@ -1301,8 +1493,8 @@ impl BridgeState {
                 return Err(error);
             }
         };
-        let updated = adapter.text();
-        if let Err(error) = adapter.project_text(session, &updated, None, session.sel.clone()) {
+        let updated = adapter.shared_paragraphs()?;
+        if let Err(error) = adapter.project_body(session, &updated, None, session.sel.clone()) {
             session.doc = before_document;
             session.sel = before_selection;
             session.reset_history();
@@ -1328,57 +1520,8 @@ impl BridgeState {
     }
 
     fn local_text_command(&mut self, session: &mut Session, id: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
-        let current = supported_body_text(&session.doc).ok_or_else(scope_error)?;
         let adapter = self.adapter.as_mut().ok_or_else(|| "Live text state is unavailable. Reconnect to continue.".to_string())?;
-        if adapter.text() != current || !adapter.editor_matches_shared(&session.doc)? {
-            return Err("The editor is catching up with live text. Wait for the update before typing.".into());
-        }
-        let before_document = session.doc.clone();
-        let before_selection = session.sel.clone();
-        let mut command_params = params.clone();
-        if id == "text.insert" {
-            if let Some(text) = params.get("text").and_then(serde_json::Value::as_str)
-                && text.chars().any(unsupported_text_char)
-            {
-                return Err("Live text supports one paragraph. Paragraph breaks and control characters are blocked.".into());
-            }
-            if let Some(object) = command_params.as_object_mut() {
-                object.insert("raw".into(), serde_json::Value::Bool(true));
-            }
-        }
-        let result = match session.run(id, &command_params) {
-            Ok(result) => result,
-            Err(error) => {
-                session.reset_history();
-                return Err(error.to_string());
-            }
-        };
-        let paragraph_mark_cleared = match clear_paragraph_mark(&mut session.doc) {
-            Ok(cleared) => cleared,
-            Err(error) => {
-                session.doc = before_document;
-                session.sel = before_selection;
-                session.reset_history();
-                session.touch();
-                session.relayout();
-                return Err(error);
-            }
-        };
-        let update = match adapter.apply_local_editor_change(session, &current) {
-            Ok(update) => update,
-            Err(error) => {
-                session.doc = before_document;
-                session.sel = before_selection;
-                session.reset_history();
-                session.touch();
-                session.relayout();
-                return Err(error);
-            }
-        };
-        if paragraph_mark_cleared {
-            session.touch();
-            session.relayout();
-        }
+        let (result, update, _paragraph_mark_cleared) = apply_local_text_command(adapter, session, id, params)?;
         if let Some(update) = update
             && let Err(error) = self.send_update(&update)
         {
@@ -1514,8 +1657,7 @@ fn enqueue_socket_event(state: &std::rc::Weak<std::cell::RefCell<BridgeState>>, 
 
 #[cfg(target_arch = "wasm32")]
 fn monotonic_now_ms() -> u64 {
-    web_sys::window().and_then(|window| window.performance()).map(|performance| performance.now()).unwrap_or_else(|| js_sys::Date::now()).max(0.0)
-        as u64
+    web_sys::window().and_then(|window| window.performance()).map(|performance| performance.now()).unwrap_or_else(js_sys::Date::now).max(0.0) as u64
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1526,11 +1668,12 @@ fn browser_error(error: wasm_bindgen::JsValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTR_BOLD, Any, Attrs, LiveText, MAX_SHARED_TEXT_BYTES, ReconnectDecision, ReconnectSchedule, is_current_socket_generation, one_splice,
-        resolve_sticky, selection_format_value, supported_body_text, validate_shared_text,
+        ATTR_BOLD, Any, Attrs, LiveText, MAX_SHARED_PARAGRAPHS, MAX_SHARED_TEXT_BYTES, ReconnectDecision, ReconnectSchedule,
+        apply_local_text_command, is_current_socket_generation, one_splice, resolve_sticky, selection_format_value, shared_text_root, supported_body,
+        supported_body_text, validate_shared_paragraphs,
     };
     use serde_json::json;
-    use wordcraft_doc::{Block, CharProps, Document};
+    use wordcraft_doc::{Block, CharProps, Document, Pos};
     use wordcraft_engine::{Selection, Session};
     use yrs::updates::decoder::Decode;
     use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
@@ -1572,54 +1715,94 @@ mod tests {
     }
 
     fn seed(text: &str) -> Vec<u8> {
+        seed_paragraphs(&[text])
+    }
+
+    fn seed_paragraphs(paragraphs: &[&str]) -> Vec<u8> {
         let doc = Doc::new();
-        let shared = doc.get_or_insert_text(super::SHARED_TEXT);
-        shared.insert(&mut doc.transact_mut(), 0, text);
+        for (index, value) in paragraphs.iter().enumerate() {
+            let shared = doc.get_or_insert_text(shared_text_root(index));
+            shared.insert(&mut doc.transact_mut(), 0, value);
+        }
         doc.transact().encode_state_as_update_v1(&StateVector::default())
     }
 
     fn formatted_seed(text: &str, start: u32, len: u32, attribute: &str, value: bool) -> Vec<u8> {
+        formatted_paragraph_seed(&[text], 0, start, len, attribute, value)
+    }
+
+    fn formatted_paragraph_seed(paragraphs: &[&str], paragraph_index: usize, start: u32, len: u32, attribute: &str, value: bool) -> Vec<u8> {
         let doc = Doc::with_options(super::DocOptions { offset_kind: super::OffsetKind::Utf16, ..super::DocOptions::default() });
-        let shared = doc.get_or_insert_text(super::SHARED_TEXT);
+        let shared_texts: Vec<_> = paragraphs.iter().enumerate().map(|(index, _)| doc.get_or_insert_text(shared_text_root(index))).collect();
         let mut transaction = doc.transact_mut();
-        shared.insert(&mut transaction, 0, text);
-        let attributes = Attrs::from([(std::sync::Arc::from(attribute), Any::Bool(value))]);
-        shared.format(&mut transaction, start, len, attributes);
+        for (index, (text, shared)) in paragraphs.iter().zip(&shared_texts).enumerate() {
+            shared.insert(&mut transaction, 0, text);
+            if index == paragraph_index {
+                let attributes = Attrs::from([(std::sync::Arc::from(attribute), Any::Bool(value))]);
+                shared.format(&mut transaction, start, len, attributes);
+            }
+        }
         drop(transaction);
         doc.transact().encode_state_as_update_v1(&StateVector::default())
     }
 
+    fn remote_insert_update(initial: &[u8], paragraph_count: usize, inserts: &[(usize, u32, &str)]) -> Vec<u8> {
+        let remote = Doc::with_options(super::DocOptions { offset_kind: super::OffsetKind::Utf16, ..super::DocOptions::default() });
+        let texts: Vec<_> = (0..paragraph_count).map(|index| remote.get_or_insert_text(shared_text_root(index))).collect();
+        remote.transact_mut().apply_update(Update::decode_v1(initial).expect("initial state decodes")).expect("initial state applies");
+        let state = remote.transact().state_vector();
+        {
+            let mut transaction = remote.transact_mut_with(remote.client_id());
+            for (paragraph_index, offset, inserted) in inserts {
+                texts[*paragraph_index].insert(&mut transaction, *offset, inserted);
+            }
+        }
+        remote.transact().encode_state_as_update_v1(&state)
+    }
+
     fn props_at(document: &Document, offset: usize) -> CharProps {
-        let Some(Block::Para(paragraph)) = document.body.first().map(|block| &**block) else { return CharProps::default() };
+        props_at_paragraph(document, 0, offset)
+    }
+
+    fn props_at_paragraph(document: &Document, paragraph_index: usize, offset: usize) -> CharProps {
+        let Some(Block::Para(paragraph)) = document.body.get(paragraph_index).map(|block| &**block) else { return CharProps::default() };
         paragraph.run_ranges().find(|(range, _)| range.start <= offset && offset < range.end).map(|(_, props)| props.clone()).unwrap_or_default()
     }
 
     fn edit(adapter: &mut LiveText, session: &mut Session, id: &str, params: serde_json::Value) -> Vec<u8> {
-        let before = supported_body_text(&session.doc).unwrap_or_default();
+        let before = supported_body(&session.doc).expect("eligible body before edit");
+        let paragraph_index = super::selected_paragraph_index(&session.sel, before.len()).expect("selection is in one paragraph");
         session.run(id, &params).expect("editor command succeeds");
-        adapter.apply_local_editor_change(session, &before).expect("local edit becomes a CRDT update").unwrap_or_default()
+        super::clear_paragraph_mark(&mut session.doc, paragraph_index).expect("paragraph mark remains supported");
+        adapter.apply_local_editor_change(session, &before, paragraph_index).expect("local edit becomes a CRDT update").unwrap_or_default()
     }
 
     fn update(adapter: &mut LiveText, session: &mut Session, bytes: &[u8]) {
         adapter.apply_remote_update(session, bytes).expect("remote update applies");
     }
 
+    fn live_for(paragraph_count: usize) -> LiveText {
+        LiveText::with_paragraph_count(paragraph_count).expect("fixed-paragraph adapter initializes")
+    }
+
     #[test]
-    fn accepts_only_one_plain_text_body_paragraph_with_supported_character_styles() {
-        assert_eq!(supported_body_text(&Document::from_text("hello")), Some("hello".into()));
-        assert!(supported_body_text(&Document::from_text("one\ntwo")).is_none());
+    fn accepts_fixed_plain_text_body_paragraphs_with_supported_character_styles() {
+        assert_eq!(supported_body_text(&Document::from_text("hello")), Some(vec!["hello".into()]));
+        assert_eq!(supported_body_text(&Document::from_text("one\ntwo")), Some(vec!["one".into(), "two".into()]));
+        let too_many = Document::from_text(&vec![""; MAX_SHARED_PARAGRAPHS + 1].join("\n"));
+        assert!(supported_body_text(&too_many).is_none());
         let mut formatted = Document::from_text("hello");
         {
             let Block::Para(paragraph) = std::sync::Arc::make_mut(&mut formatted.body[0]) else { return };
             paragraph.runs[0].props = CharProps { bold: Some(true), ..CharProps::default() };
         }
-        assert_eq!(supported_body_text(&formatted), Some("hello".into()));
+        assert_eq!(supported_body_text(&formatted), Some(vec!["hello".into()]));
         {
             let Block::Para(paragraph) = std::sync::Arc::make_mut(&mut formatted.body[0]) else { return };
             paragraph.runs[0].props.italic = Some(false);
             paragraph.runs[0].props.underline = Some(wordcraft_doc::props::Underline::Single);
         }
-        assert_eq!(supported_body_text(&formatted), Some("hello".into()));
+        assert_eq!(supported_body_text(&formatted), Some(vec!["hello".into()]));
         {
             let Block::Para(paragraph) = std::sync::Arc::make_mut(&mut formatted.body[0]) else { return };
             paragraph.runs[0].props.underline = Some(wordcraft_doc::props::Underline::Double);
@@ -1637,13 +1820,29 @@ mod tests {
         let value = "前😀後";
         let initial = formatted_seed(value, 1, 2, ATTR_BOLD, true);
         let mut session = Session::new(Document::from_text(value));
-        let mut adapter = LiveText::new();
+        let mut adapter = live_for(1);
 
         adapter.apply_full_state(&mut session, &initial).expect("formatted server state applies");
 
-        assert_eq!(supported_body_text(&session.doc), Some(value.into()));
+        assert_eq!(supported_body_text(&session.doc), Some(vec![value.into()]));
         assert_eq!(props_at(&session.doc, "前".len()).bold, Some(true));
         assert_eq!(props_at(&session.doc, "前😀".len()).bold, None);
+    }
+
+    #[test]
+    fn two_paragraph_seed_projects_formatted_runs_from_the_matching_root() {
+        let paragraphs = ["前😀後", "bold here"];
+        let initial = formatted_paragraph_seed(&paragraphs, 1, 0, 4, ATTR_BOLD, true);
+        let mut session = Session::new(Document::from_text(&paragraphs.join("\n")));
+        let mut adapter = live_for(paragraphs.len());
+
+        adapter.apply_full_state(&mut session, &initial).expect("multi-paragraph state applies");
+
+        assert_eq!(supported_body_text(&session.doc), Some(paragraphs.iter().map(|text| (*text).to_string()).collect()));
+        assert_eq!(props_at_paragraph(&session.doc, 0, 0).bold, None);
+        assert_eq!(props_at_paragraph(&session.doc, 1, 0).bold, Some(true));
+        assert_eq!(props_at_paragraph(&session.doc, 1, 4).bold, None);
+        assert!(adapter.editor_matches_shared(&session.doc).expect("the projected paragraphs match the roots"));
     }
 
     #[test]
@@ -1651,8 +1850,8 @@ mod tests {
         let initial = formatted_seed("ab", 0, 2, ATTR_BOLD, true);
         let mut alice_session = Session::new(Document::from_text("ab"));
         let mut bob_session = Session::new(Document::from_text("ab"));
-        let mut alice = LiveText::new();
-        let mut bob = LiveText::new();
+        let mut alice = live_for(1);
+        let mut bob = live_for(1);
         alice.apply_full_state(&mut alice_session, &initial).expect("Alice receives formatted seed");
         bob.apply_full_state(&mut bob_session, &initial).expect("Bob receives formatted seed");
 
@@ -1660,8 +1859,8 @@ mod tests {
         let alice_insert = edit(&mut alice, &mut alice_session, "text.insert", json!({"text":"X", "raw":true}));
         update(&mut bob, &mut bob_session, &alice_insert);
 
-        assert_eq!(supported_body_text(&alice_session.doc), Some("aXb".into()));
-        assert_eq!(supported_body_text(&bob_session.doc), Some("aXb".into()));
+        assert_eq!(supported_body_text(&alice_session.doc), Some(vec!["aXb".into()]));
+        assert_eq!(supported_body_text(&bob_session.doc), Some(vec!["aXb".into()]));
         for offset in 0..3 {
             assert_eq!(props_at(&alice_session.doc, offset).bold, Some(true));
             assert_eq!(props_at(&bob_session.doc, offset).bold, Some(true));
@@ -1671,12 +1870,159 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_edits_in_different_paragraph_roots_converge() {
+        let initial = seed_paragraphs(&["one", "two"]);
+        let mut alice_session = Session::new(Document::from_text("one\ntwo"));
+        let mut bob_session = Session::new(Document::from_text("one\ntwo"));
+        let mut alice = live_for(2);
+        let mut bob = live_for(2);
+        alice.apply_full_state(&mut alice_session, &initial).expect("Alice receives both paragraph roots");
+        bob.apply_full_state(&mut bob_session, &initial).expect("Bob receives both paragraph roots");
+
+        alice_session.sel = Selection::caret(Pos::body(0, 3));
+        bob_session.sel = Selection::caret(Pos::body(1, 3));
+        let alice_update = edit(&mut alice, &mut alice_session, "text.insert", json!({"text":"A", "raw":true}));
+        let bob_update = edit(&mut bob, &mut bob_session, "text.insert", json!({"text":"B", "raw":true}));
+
+        update(&mut alice, &mut alice_session, &bob_update);
+        update(&mut bob, &mut bob_session, &alice_update);
+
+        let expected = Some(vec!["oneA".to_string(), "twoB".to_string()]);
+        assert_eq!(supported_body_text(&alice_session.doc), expected);
+        assert_eq!(supported_body_text(&bob_session.doc), expected);
+        assert!(alice.editor_matches_shared(&alice_session.doc).expect("Alice matches both roots"));
+        assert!(bob.editor_matches_shared(&bob_session.doc).expect("Bob matches both roots"));
+    }
+
+    #[test]
+    fn remote_edit_only_invalidates_the_changed_paragraph_layout() {
+        let initial = seed_paragraphs(&["stable", "target"]);
+        let mut session = Session::new(Document::from_text("stable\ntarget"));
+        let mut adapter = live_for(2);
+        adapter.apply_full_state(&mut session, &initial).expect("both roots seed");
+        let first_revision = session.doc.body.first().and_then(|block| block.as_para()).expect("first paragraph exists").rev;
+        let second_revision = session.doc.body.get(1).and_then(|block| block.as_para()).expect("second paragraph exists").rev;
+
+        let remote_update = remote_insert_update(&initial, 2, &[(1, 1, "!")]);
+        update(&mut adapter, &mut session, &remote_update);
+
+        let updated_first_revision = session.doc.body.first().and_then(|block| block.as_para()).expect("first paragraph remains").rev;
+        let updated_second_revision = session.doc.body.get(1).and_then(|block| block.as_para()).expect("second paragraph remains").rev;
+        assert_eq!(updated_first_revision, first_revision, "an unchanged paragraph keeps its layout cache key");
+        assert!(updated_second_revision > second_revision, "the remotely edited paragraph is invalidated");
+        assert_eq!(supported_body_text(&session.doc), Some(vec!["stable".into(), "t!arget".into()]));
+    }
+
+    #[test]
+    fn concurrent_same_root_inserts_converge_and_actor_undo_isolated_across_roots() {
+        let initial = seed_paragraphs(&["x", "y"]);
+        let mut alice_session = Session::new(Document::from_text("x\ny"));
+        let mut bob_session = Session::new(Document::from_text("x\ny"));
+        let mut alice = live_for(2);
+        let mut bob = live_for(2);
+        alice.apply_full_state(&mut alice_session, &initial).expect("Alice receives both roots");
+        bob.apply_full_state(&mut bob_session, &initial).expect("Bob receives both roots");
+
+        alice_session.sel = Selection::caret(Pos::body(0, 0));
+        bob_session.sel = Selection::caret(Pos::body(0, 0));
+        let alice_insert = edit(&mut alice, &mut alice_session, "text.insert", json!({"text":"A", "raw":true}));
+        let bob_insert = edit(&mut bob, &mut bob_session, "text.insert", json!({"text":"B", "raw":true}));
+        update(&mut alice, &mut alice_session, &bob_insert);
+        update(&mut bob, &mut bob_session, &alice_insert);
+        assert_eq!(supported_body_text(&alice_session.doc), supported_body_text(&bob_session.doc));
+
+        bob_session.sel = Selection::caret(Pos::body(1, 1));
+        let remote_other_root = edit(&mut bob, &mut bob_session, "text.insert", json!({"text":"R", "raw":true}));
+        update(&mut alice, &mut alice_session, &remote_other_root);
+        assert_eq!(supported_body_text(&alice_session.doc), Some(vec![supported_body_text(&bob_session.doc).unwrap()[0].clone(), "yR".into()]));
+
+        let undo = alice.undo_or_redo(&mut alice_session, false).expect("local actor undo succeeds").expect("Alice's insert is undoable");
+        update(&mut bob, &mut bob_session, &undo);
+
+        let alice_body = supported_body_text(&alice_session.doc).expect("Alice keeps a supported body");
+        let bob_body = supported_body_text(&bob_session.doc).expect("Bob keeps a supported body");
+        assert_eq!(alice_body, bob_body);
+        assert!(alice_body[0].contains('B'), "Bob's same-root insert must remain after Alice undoes hers");
+        assert!(!alice_body[0].contains('A'), "Alice's local insert should be undone");
+        assert_eq!(alice_body[1], "yR", "undo in paragraph 0 must preserve the remote edit in paragraph 1");
+    }
+
+    #[test]
+    fn formatting_a_selection_updates_only_its_paragraph_root() {
+        let initial = seed_paragraphs(&["first", "bold"]);
+        let mut alice_session = Session::new(Document::from_text("first\nbold"));
+        let mut bob_session = Session::new(Document::from_text("first\nbold"));
+        let mut alice = live_for(2);
+        let mut bob = live_for(2);
+        alice.apply_full_state(&mut alice_session, &initial).expect("Alice receives both roots");
+        bob.apply_full_state(&mut bob_session, &initial).expect("Bob receives both roots");
+
+        alice_session.sel = Selection { anchor: Pos::body(1, 0), focus: Pos::body(1, 4) };
+        alice_session.run("format.bold", &json!({"value":true})).expect("selection formats");
+        super::clear_paragraph_mark(&mut alice_session.doc, 1).expect("paragraph mark resets");
+        let bold = selection_format_value(&alice_session.doc, 1, "format.bold", 0, 4).expect("formatted selection reads back");
+        let format_update =
+            alice.apply_format_update(1, "format.bold", 0, 4, bold).expect("format update encodes").expect("second-root format changes shared state");
+        update(&mut bob, &mut bob_session, &format_update);
+
+        assert_eq!(supported_body_text(&alice_session.doc), Some(vec!["first".into(), "bold".into()]));
+        assert_eq!(props_at_paragraph(&alice_session.doc, 0, 0).bold, None);
+        assert_eq!(props_at_paragraph(&alice_session.doc, 1, 0).bold, Some(true));
+        assert_eq!(props_at_paragraph(&bob_session.doc, 1, 0).bold, Some(true));
+        assert!(alice.editor_matches_shared(&alice_session.doc).expect("Alice matches the two roots"));
+        assert!(bob.editor_matches_shared(&bob_session.doc).expect("Bob matches the two roots"));
+    }
+
+    #[test]
+    fn unicode_selection_stays_on_its_root_and_rebases_through_remote_inserts() {
+        let initial = seed_paragraphs(&["first", "前😀後"]);
+        let mut session = Session::new(Document::from_text("first\n前😀後"));
+        let mut local = live_for(2);
+        local.apply_full_state(&mut session, &initial).expect("both roots seed");
+        session.sel = Selection { anchor: Pos::body(1, "前😀".len()), focus: Pos::body(0, "fi".len()) };
+
+        let remote_update = remote_insert_update(&initial, 2, &[(0, 0, "遠"), (1, 1, "乙")]);
+        update(&mut local, &mut session, &remote_update);
+
+        assert_eq!(supported_body_text(&session.doc), Some(vec!["遠first".into(), "前乙😀後".into()]));
+        assert_eq!(session.sel.anchor.path, wordcraft_doc::Path::top(1));
+        assert_eq!(session.sel.focus.path, wordcraft_doc::Path::top(0));
+        assert!(session.sel.anchor.off > session.sel.focus.off, "reversed selection direction is retained");
+        assert_eq!(session.sel.anchor.off, "前乙😀".len());
+        assert_eq!(session.sel.focus.off, "遠fi".len());
+    }
+
+    #[test]
+    fn paragraph_breaks_merges_and_cross_paragraph_deletes_are_rejected_without_editor_changes() {
+        let initial = seed_paragraphs(&["one", "two"]);
+        let mut session = Session::new(Document::from_text("one\ntwo"));
+        let mut adapter = live_for(2);
+        adapter.apply_full_state(&mut session, &initial).expect("both roots seed");
+
+        for (selection, id, params) in [
+            (Selection::caret(Pos::body(0, 1)), "text.insert", json!({"text":"\n"})),
+            (Selection::caret(Pos::body(1, 0)), "text.backspace", json!({})),
+            (Selection::caret(Pos::body(0, 3)), "text.delete", json!({})),
+            (Selection { anchor: Pos::body(0, 0), focus: Pos::body(1, 1) }, "text.delete", json!({})),
+        ] {
+            session.sel = selection.clone();
+            let before_doc = session.doc.clone();
+            let before_selection = session.sel.clone();
+            let error = apply_local_text_command(&mut adapter, &mut session, id, &params).expect_err("structural edit is blocked");
+            assert!(!error.is_empty());
+            assert_eq!(session.doc, before_doc, "a rejected command leaves all paragraphs unchanged");
+            assert_eq!(session.sel, before_selection, "a rejected command leaves the visible selection unchanged");
+            assert_eq!(adapter.body_texts().expect("shared roots remain readable"), vec!["one", "two"]);
+        }
+    }
+
+    #[test]
     fn live_format_update_syncs_and_actor_undo_preserves_remote_text() {
         let initial = seed("text");
         let mut alice_session = Session::new(Document::from_text("text"));
         let mut bob_session = Session::new(Document::from_text("text"));
-        let mut alice = LiveText::new();
-        let mut bob = LiveText::new();
+        let mut alice = live_for(1);
+        let mut bob = live_for(1);
         alice.apply_full_state(&mut alice_session, &initial).expect("Alice receives seed");
         bob.apply_full_state(&mut bob_session, &initial).expect("Bob receives seed");
 
@@ -1685,21 +2031,21 @@ mod tests {
         update(&mut alice, &mut alice_session, &bob_insert);
         alice_session.sel = Selection { anchor: wordcraft_doc::Pos::body(0, 0), focus: wordcraft_doc::Pos::body(0, "text".len()) };
         alice_session.run("format.bold", &json!({"value":true})).expect("Alice formats selection");
-        super::clear_paragraph_mark(&mut alice_session.doc).expect("paragraph mark remains unformatted");
-        let bold = selection_format_value(&alice_session.doc, "format.bold", 0, "text".len()).expect("selection has bold value");
+        super::clear_paragraph_mark(&mut alice_session.doc, 0).expect("paragraph mark remains unformatted");
+        let bold = selection_format_value(&alice_session.doc, 0, "format.bold", 0, "text".len()).expect("selection has bold value");
         let format_update =
-            alice.apply_format_update("format.bold", 0, "text".len(), bold).expect("format update encodes").expect("format changes shared state");
+            alice.apply_format_update(0, "format.bold", 0, "text".len(), bold).expect("format update encodes").expect("format changes shared state");
         update(&mut bob, &mut bob_session, &format_update);
         for (id, params) in [("format.italic", json!({"value":true})), ("format.underline", json!({"value":true}))] {
             alice_session.run(id, &params).expect("Alice applies another supported character style");
-            super::clear_paragraph_mark(&mut alice_session.doc).expect("paragraph mark remains unformatted");
-            let value = selection_format_value(&alice_session.doc, id, 0, "text".len()).expect("selection has the applied style");
+            super::clear_paragraph_mark(&mut alice_session.doc, 0).expect("paragraph mark remains unformatted");
+            let value = selection_format_value(&alice_session.doc, 0, id, 0, "text".len()).expect("selection has the applied style");
             let format_update =
-                alice.apply_format_update(id, 0, "text".len(), value).expect("format update encodes").expect("style changes shared state");
+                alice.apply_format_update(0, id, 0, "text".len(), value).expect("format update encodes").expect("style changes shared state");
             update(&mut bob, &mut bob_session, &format_update);
         }
-        assert_eq!(supported_body_text(&alice_session.doc), Some("text B".into()));
-        assert_eq!(supported_body_text(&bob_session.doc), Some("text B".into()));
+        assert_eq!(supported_body_text(&alice_session.doc), Some(vec!["text B".into()]));
+        assert_eq!(supported_body_text(&bob_session.doc), Some(vec!["text B".into()]));
         assert_eq!(props_at(&bob_session.doc, 0).bold, Some(true));
         assert_eq!(props_at(&bob_session.doc, 0).italic, Some(true));
         assert_eq!(props_at(&bob_session.doc, 0).underline, Some(wordcraft_doc::props::Underline::Single));
@@ -1707,15 +2053,15 @@ mod tests {
 
         let undo = alice.undo_or_redo(&mut alice_session, false).expect("format undo succeeds").expect("format undo emits update");
         update(&mut bob, &mut bob_session, &undo);
-        assert_eq!(supported_body_text(&alice_session.doc), Some("text B".into()));
-        assert_eq!(supported_body_text(&bob_session.doc), Some("text B".into()));
+        assert_eq!(supported_body_text(&alice_session.doc), Some(vec!["text B".into()]));
+        assert_eq!(supported_body_text(&bob_session.doc), Some(vec!["text B".into()]));
         assert_eq!(props_at(&bob_session.doc, 0), CharProps::default());
         assert_eq!(props_at(&bob_session.doc, "text ".len()), CharProps::default());
 
         let redo = alice.undo_or_redo(&mut alice_session, true).expect("format redo succeeds").expect("format redo emits update");
         update(&mut bob, &mut bob_session, &redo);
-        assert_eq!(supported_body_text(&alice_session.doc), Some("text B".into()));
-        assert_eq!(supported_body_text(&bob_session.doc), Some("text B".into()));
+        assert_eq!(supported_body_text(&alice_session.doc), Some(vec!["text B".into()]));
+        assert_eq!(supported_body_text(&bob_session.doc), Some(vec!["text B".into()]));
         assert_eq!(props_at(&alice_session.doc, 0).bold, Some(true));
         assert_eq!(props_at(&bob_session.doc, 0).bold, Some(true));
     }
@@ -1724,18 +2070,18 @@ mod tests {
     fn deleting_all_formatted_text_keeps_an_empty_supported_paragraph() {
         let initial = formatted_seed("bold", 0, 4, super::ATTR_BOLD, true);
         let mut session = Session::new(Document::from_text("bold"));
-        let mut adapter = LiveText::new();
+        let mut adapter = live_for(1);
         adapter.apply_full_state(&mut session, &initial).expect("formatted server state applies");
         session.sel = Selection { anchor: wordcraft_doc::Pos::body(0, 0), focus: wordcraft_doc::Pos::body(0, 4) };
-        let before = "bold";
+        let before = supported_body(&session.doc).expect("supported body before deletion");
         session.run("text.delete", &json!({})).expect("selected text deletes");
-        super::clear_paragraph_mark(&mut session.doc).expect("paragraph mark resets");
+        super::clear_paragraph_mark(&mut session.doc, 0).expect("paragraph mark resets");
 
         let update_bytes =
-            adapter.apply_local_editor_change(&mut session, before).expect("deletion becomes a CRDT update").expect("delete emits update");
-        assert_eq!(supported_body_text(&session.doc), Some(String::new()));
+            adapter.apply_local_editor_change(&mut session, &before, 0).expect("deletion becomes a CRDT update").expect("delete emits update");
+        assert_eq!(supported_body_text(&session.doc), Some(vec![String::new()]));
         assert!(!update_bytes.is_empty());
-        assert_eq!(adapter.text(), "");
+        assert_eq!(adapter.body_texts().expect("live text reads"), vec![String::new()]);
     }
 
     #[test]
@@ -1750,8 +2096,8 @@ mod tests {
         let initial = seed("前後");
         let mut alice_session = Session::new(Document::from_text("前後"));
         let mut bob_session = Session::new(Document::from_text("前後"));
-        let mut alice = LiveText::new();
-        let mut bob = LiveText::new();
+        let mut alice = live_for(1);
+        let mut bob = live_for(1);
         alice.apply_full_state(&mut alice_session, &initial).expect("Alice receives server state");
         bob.apply_full_state(&mut bob_session, &initial).expect("Bob receives server state");
 
@@ -1765,7 +2111,7 @@ mod tests {
 
         let undo_update = alice.undo_or_redo(&mut alice_session, false).expect("local undo").expect("local insertion is undoable");
         update(&mut bob, &mut bob_session, &undo_update);
-        assert_eq!(supported_body_text(&alice_session.doc), Some("前乙e\u{301}後".into()));
+        assert_eq!(supported_body_text(&alice_session.doc), Some(vec!["前乙e\u{301}後".into()]));
         assert_eq!(supported_body_text(&alice_session.doc), supported_body_text(&bob_session.doc));
 
         let redo_update = alice.undo_or_redo(&mut alice_session, true).expect("local redo").expect("local undo is redoable");
@@ -1777,7 +2123,7 @@ mod tests {
     fn incoming_insert_rebases_the_existing_caret_with_a_sticky_anchor() {
         let initial = seed("前後");
         let mut session = Session::new(Document::from_text("前後"));
-        let mut local = LiveText::new();
+        let mut local = live_for(1);
         local.apply_full_state(&mut session, &initial).expect("server state applies");
         session.sel = Selection::caret(wordcraft_doc::Pos::body(0, "前".len()));
 
@@ -1796,7 +2142,7 @@ mod tests {
         let _ = initial_text.get_string(&initial_doc.transact());
 
         local.apply_remote_update(&mut session, &remote_update).expect("remote text applies");
-        assert_eq!(supported_body_text(&session.doc), Some("乙前後".into()));
+        assert_eq!(supported_body_text(&session.doc), Some(vec!["乙前後".into()]));
         assert_eq!(session.sel.focus.off, "乙前".len());
     }
 
@@ -1805,7 +2151,7 @@ mod tests {
         let value = "前😀";
         let initial = seed(value);
         let mut session = Session::new(Document::from_text(value));
-        let mut local = LiveText::new();
+        let mut local = live_for(1);
         local.apply_full_state(&mut session, &initial).expect("server state applies");
         session.sel = Selection::caret(wordcraft_doc::Pos::body(0, value.len()));
 
@@ -1817,7 +2163,7 @@ mod tests {
         let remote_update = remote.transact().encode_state_as_update_v1(&state);
 
         local.apply_remote_update(&mut session, &remote_update).expect("remote end insert applies");
-        assert_eq!(supported_body_text(&session.doc), Some("前😀乙".into()));
+        assert_eq!(supported_body_text(&session.doc), Some(vec!["前😀乙".into()]));
         assert_eq!(session.sel.focus.off, "前😀乙".len());
     }
 
@@ -1825,7 +2171,7 @@ mod tests {
     fn reversed_selection_around_emoji_rebases_when_remote_text_enters_one_boundary() {
         let initial = seed("前😀後");
         let mut session = Session::new(Document::from_text("前😀後"));
-        let mut local = LiveText::new();
+        let mut local = live_for(1);
         local.apply_full_state(&mut session, &initial).expect("server state applies");
         session.sel = Selection { anchor: wordcraft_doc::Pos::body(0, "前😀".len()), focus: wordcraft_doc::Pos::body(0, "前".len()) };
 
@@ -1837,7 +2183,7 @@ mod tests {
         let remote_update = remote.transact().encode_state_as_update_v1(&state);
 
         local.apply_remote_update(&mut session, &remote_update).expect("remote insert projects");
-        assert_eq!(supported_body_text(&session.doc), Some("前乙😀後".into()));
+        assert_eq!(supported_body_text(&session.doc), Some(vec!["前乙😀後".into()]));
         assert!(session.sel.anchor.off > session.sel.focus.off, "selection direction must remain reversed");
         assert_eq!(session.sel.anchor.off, "前乙😀".len());
         assert_eq!(session.sel.focus.off, "前".len(), "the focus should remain before text inserted at its boundary");
@@ -1857,30 +2203,30 @@ mod tests {
         let initial = seed("前後");
         let mut session = Session::new(Document::from_text("前後"));
         let mut peer_session = Session::new(Document::from_text("前後"));
-        let mut local = LiveText::new();
-        let mut peer = LiveText::new();
+        let mut local = live_for(1);
+        let mut peer = live_for(1);
         local.apply_full_state(&mut session, &initial).expect("server state applies");
         peer.apply_full_state(&mut peer_session, &initial).expect("peer state applies");
-        assert_eq!(local.text.len(&local.doc.transact()), 2, "UTF-16 mode uses one index per Han character");
+        assert_eq!(local.texts[0].len(&local.doc.transact()), 2, "UTF-16 mode uses one index per Han character");
 
         session.sel = Selection::caret(wordcraft_doc::Pos::body(0, "前".len()));
         let insert = edit(&mut local, &mut session, "text.insert", json!({"text":"甲" , "raw":true}));
         assert!(!insert.is_empty(), "Unicode insertion must produce a Yrs update");
-        assert_eq!(supported_body_text(&session.doc), Some("前甲後".into()));
+        assert_eq!(supported_body_text(&session.doc), Some(vec!["前甲後".into()]));
         update(&mut peer, &mut peer_session, &insert);
 
         local.undo.as_mut().expect("undo manager exists").reset();
         session.sel = Selection::caret(wordcraft_doc::Pos::body(0, "前甲".len()));
         let delete = edit(&mut local, &mut session, "text.backspace", json!({}));
         assert!(!delete.is_empty(), "delete-only updates must be emitted even when the state vector does not advance");
-        assert_eq!(supported_body_text(&session.doc), Some("前後".into()));
+        assert_eq!(supported_body_text(&session.doc), Some(vec!["前後".into()]));
         update(&mut peer, &mut peer_session, &delete);
-        assert_eq!(supported_body_text(&peer_session.doc), Some("前後".into()));
+        assert_eq!(supported_body_text(&peer_session.doc), Some(vec!["前後".into()]));
 
         let undo = local.undo_or_redo(&mut session, false).expect("delete can be undone").expect("undo emits a Yrs update");
         update(&mut peer, &mut peer_session, &undo);
-        assert_eq!(supported_body_text(&session.doc), Some("前甲後".into()));
-        assert_eq!(supported_body_text(&peer_session.doc), Some("前甲後".into()));
+        assert_eq!(supported_body_text(&session.doc), Some(vec!["前甲後".into()]));
+        assert_eq!(supported_body_text(&peer_session.doc), Some(vec!["前甲後".into()]));
     }
 
     #[test]
@@ -1891,7 +2237,7 @@ mod tests {
         server.transact_mut().apply_update(Update::decode_v1(&initial).expect("seed update decodes")).expect("server seed applies");
 
         let mut session = Session::new(Document::from_text("前後"));
-        let mut client = LiveText::new();
+        let mut client = live_for(1);
         client.apply_full_state(&mut session, &initial).expect("client receives server state");
         session.sel = Selection::caret(wordcraft_doc::Pos::body(0, "前".len()));
         let update = edit(&mut client, &mut session, "text.insert", json!({"text":"🧑🏽‍🚀", "raw":true}));
@@ -1907,21 +2253,25 @@ mod tests {
     fn shared_text_limit_matches_the_server_and_rejects_oversized_local_edits() {
         let boundary = "x".repeat(MAX_SHARED_TEXT_BYTES);
         let too_large = format!("{boundary}x");
-        assert!(validate_shared_text(&boundary).is_ok());
+        assert!(supported_body(&Document::from_text(&boundary)).is_some());
         assert!(supported_body_text(&Document::from_text(&boundary)).is_some());
-        assert!(validate_shared_text(&too_large).is_err());
+        assert!(supported_body(&Document::from_text(&too_large)).is_none());
+        let combined_overflow =
+            vec![super::SharedParagraph { text: boundary.clone(), runs: Vec::new() }, super::SharedParagraph { text: "x".into(), runs: Vec::new() }];
+        assert!(validate_shared_paragraphs(&combined_overflow).is_err(), "the byte cap applies across the fixed body");
         assert!(supported_body_text(&Document::from_text(&too_large)).is_none());
 
         let initial = seed("small");
         let mut session = Session::new(Document::from_text("small"));
-        let mut local = LiveText::new();
+        let mut local = live_for(1);
         local.apply_full_state(&mut session, &initial).expect("server state applies");
         let paragraph = session.doc.para_mut(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path::top(0)).expect("body paragraph exists");
         let old_len = paragraph.len();
         paragraph.delete(0, old_len).expect("old text removes");
         paragraph.insert_text(0, &too_large, &CharProps::default()).expect("oversized editor state is constructed");
-        let error = local.apply_local_editor_change(&mut session, "small").expect_err("oversized local edit is rejected");
+        let before = supported_body(&Document::from_text("small")).expect("small seed is eligible");
+        let error = local.apply_local_editor_change(&mut session, &before, 0).expect_err("oversized local edit is rejected");
         assert!(error.contains("8 MiB"));
-        assert_eq!(local.text(), "small", "rejected text must not enter the local CRDT");
+        assert_eq!(local.body_texts().expect("live text reads"), vec!["small"], "rejected text must not enter the local CRDT");
     }
 }

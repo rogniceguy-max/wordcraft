@@ -1,9 +1,8 @@
 //! Local, durable document storage for the WordCraft browser editor.
 //!
 //! Snapshot writes use compare-and-swap versions. A stale client receives a conflict and cannot
-//! silently replace a newer snapshot. A narrow WebSocket prototype syncs one paragraph with plain
-//! text and selected character styles;
-//! it is not a rich-document collaboration adapter for the browser editor.
+//! silently replace a newer snapshot. The WebSocket prototype syncs a fixed set of body paragraphs
+//! with plain text and selected character styles; it is not a rich-document collaboration adapter.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::collections::{HashMap, HashSet};
@@ -38,6 +37,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TITLE_CHARS: usize = 240;
 const MAX_COLLAB_UPDATE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COLLAB_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_COLLAB_PARAGRAPHS: usize = 256;
 const COLLAB_TEXT_ROOT: &str = "body:main";
 const COLLAB_ROOM_CAPACITY: usize = 256;
 
@@ -98,6 +98,7 @@ struct CollaborationRooms {
 struct CollaborationRoom {
     id: String,
     epoch: u64,
+    paragraph_count: usize,
     #[cfg(test)]
     seed_update: Vec<u8>,
     state: Mutex<CollaborationRoomState>,
@@ -117,8 +118,15 @@ struct StoredCollaborationUpdate {
 
 struct CollaborationData {
     epoch: u64,
+    paragraph_count: usize,
     seed_update: Vec<u8>,
     updates: Vec<StoredCollaborationUpdate>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CollaborationParagraph {
+    text: String,
+    runs: Vec<wordcraft_doc::Run>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -413,7 +421,7 @@ enum StoreError {
     Poisoned,
     #[error("document version is out of range")]
     VersionRange,
-    #[error("real-time collaboration supports only one plain-text body paragraph: {0}")]
+    #[error("real-time collaboration supports one to 256 plain-text top-level paragraphs: {0}")]
     UnsupportedCollaborationDocument(String),
     #[error("invalid Yrs v1 collaboration update: {0}")]
     InvalidCollaborationUpdate(String),
@@ -720,6 +728,10 @@ impl Store {
             return Err(StoreError::Deleted);
         }
 
+        let snapshot = serde_json::from_slice::<Value>(&row.0).map_err(|error| StoreError::Corrupt(error.to_string()))?;
+        let document = wordcraft_engine::io::document_from_storage_snapshot(&snapshot).map_err(|error| StoreError::Corrupt(error.to_string()))?;
+        let paragraph_count = collaboration_seed_content(&document)?.len();
+
         let collaboration = transaction
             .query_row("SELECT epoch, seed_update FROM collaboration_documents WHERE document_id = ?1", [id], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
@@ -728,8 +740,6 @@ impl Store {
         let (epoch, seed_update) = if let Some((epoch, seed_update)) = collaboration {
             (positive_version(epoch)?, seed_update)
         } else {
-            let snapshot = serde_json::from_slice::<Value>(&row.0).map_err(|error| StoreError::Corrupt(error.to_string()))?;
-            let document = wordcraft_engine::io::document_from_storage_snapshot(&snapshot).map_err(|error| StoreError::Corrupt(error.to_string()))?;
             let seed_update = make_collaboration_seed(&document)?;
             transaction
                 .execute("INSERT INTO collaboration_documents(document_id, epoch, seed_update) VALUES(?1, 1, ?2)", params![id, seed_update])?;
@@ -748,7 +758,7 @@ impl Store {
             }
         }
         transaction.commit()?;
-        Ok(CollaborationData { epoch, seed_update, updates })
+        Ok(CollaborationData { epoch, paragraph_count, seed_update, updates })
     }
 
     fn append_collaboration_update(
@@ -757,8 +767,7 @@ impl Store {
         epoch: u64,
         digest: &[u8],
         update: &[u8],
-        text: &str,
-        runs: &[wordcraft_doc::Run],
+        paragraphs: &[CollaborationParagraph],
     ) -> Result<bool, StoreError> {
         if digest.len() != 32 || Sha256::digest(update).as_slice() != digest {
             return Err(StoreError::InvalidCollaborationUpdate("update digest does not match payload".into()));
@@ -800,10 +809,18 @@ impl Store {
         // remain separate from the collaboration epoch and update log.
         let snapshot = serde_json::from_slice::<Value>(&document_row.1).map_err(|error| StoreError::Corrupt(error.to_string()))?;
         let mut document = wordcraft_engine::io::document_from_storage_snapshot(&snapshot).map_err(|error| StoreError::Corrupt(error.to_string()))?;
-        let _ = collaboration_seed_content(&document)?;
-        let mut paragraph = wordcraft_doc::Paragraph::with_text(text, wordcraft_doc::CharProps::default());
-        paragraph.runs = runs.to_vec();
-        document.body = vec![wordcraft_doc::para_block(paragraph)];
+        let stored_paragraphs = collaboration_seed_content(&document)?;
+        if stored_paragraphs.len() != paragraphs.len() || document.body.len() != paragraphs.len() {
+            return Err(StoreError::InvalidCollaborationState("stored paragraph structure changed during the collaboration epoch".into()));
+        }
+        for (block, shared) in document.body.iter_mut().zip(paragraphs) {
+            let wordcraft_doc::Block::Para(paragraph) = Arc::make_mut(block) else {
+                return Err(StoreError::InvalidCollaborationState("stored body contains a non-paragraph block".into()));
+            };
+            paragraph.text.clone_from(&shared.text);
+            paragraph.runs.clone_from(&shared.runs);
+            paragraph.touch();
+        }
         document.core.modified = wordcraft_engine::cmd::now_iso();
         let snapshot = wordcraft_engine::io::storage_snapshot(&document).map_err(StoreError::InvalidSnapshot)?;
         let snapshot_bytes = serde_json::to_vec(&snapshot)?;
@@ -946,12 +963,13 @@ impl CollaborationRooms {
 
 impl CollaborationRoom {
     fn from_data(id: String, data: CollaborationData) -> Result<Self, StoreError> {
-        let document = rebuild_collaboration_document(&data.seed_update, &data.updates, false)?;
+        let document = rebuild_collaboration_document(&data.seed_update, &data.updates, data.paragraph_count, false)?;
         let digests = data.updates.iter().map(|update| update.digest.clone()).collect();
         let (updates, _) = broadcast::channel(COLLAB_ROOM_CAPACITY);
         Ok(CollaborationRoom {
             id,
             epoch: data.epoch,
+            paragraph_count: data.paragraph_count,
             #[cfg(test)]
             seed_update: data.seed_update,
             state: Mutex::new(CollaborationRoomState { document, digests }),
@@ -980,18 +998,18 @@ impl CollaborationRoom {
 
         let update = StoredCollaborationUpdate { digest: digest.clone(), bytes: bytes.to_vec() };
         let current_state = state.document.transact().encode_state_as_update_v1(&StateVector::default());
-        let candidate = rebuild_collaboration_document(&current_state, std::slice::from_ref(&update), true)?;
+        let candidate = rebuild_collaboration_document(&current_state, std::slice::from_ref(&update), self.paragraph_count, true)?;
 
-        let (text, runs) = collaboration_content(&candidate).map_err(StoreError::InvalidCollaborationUpdate)?;
-        let inserted = store.append_collaboration_update(&self.id, self.epoch, &digest, bytes, &text, &runs)?;
+        let paragraphs = collaboration_content(&candidate, self.paragraph_count).map_err(StoreError::InvalidCollaborationUpdate)?;
+        let inserted = store.append_collaboration_update(&self.id, self.epoch, &digest, bytes, &paragraphs)?;
         if !inserted {
             // This can happen if another server process stored the same payload while this room
             // was running. Refresh from the durable log and avoid a duplicate broadcast.
             let data = store.load_or_seed_collaboration(&self.id)?;
-            if data.epoch != self.epoch {
+            if data.epoch != self.epoch || data.paragraph_count != self.paragraph_count {
                 return Err(StoreError::CollaborationEpoch);
             }
-            let document = rebuild_collaboration_document(&data.seed_update, &data.updates, false)?;
+            let document = rebuild_collaboration_document(&data.seed_update, &data.updates, data.paragraph_count, false)?;
             state.digests = data.updates.iter().map(|entry| entry.digest.clone()).collect();
             state.document = document;
             return Ok(false);
@@ -1004,53 +1022,64 @@ impl CollaborationRoom {
     }
 }
 
-fn collaboration_seed_content(document: &wordcraft_doc::Document) -> Result<(String, Vec<wordcraft_doc::Run>), StoreError> {
+fn collaboration_seed_content(document: &wordcraft_doc::Document) -> Result<Vec<CollaborationParagraph>, StoreError> {
     if document.settings.track_changes || document.settings.protection.is_some() {
         return Err(StoreError::UnsupportedCollaborationDocument("track changes and document protection are not supported".into()));
     }
     if !document.parts.is_empty() || !document.comments.is_empty() || !document.revisions.is_empty() || !document.sources.is_empty() {
         return Err(StoreError::UnsupportedCollaborationDocument("headers, footers, comments, revisions, and sources are not supported".into()));
     }
-    if document.body.len() != 1 {
-        return Err(StoreError::UnsupportedCollaborationDocument("the body must contain exactly one paragraph".into()));
+    if document.body.is_empty() || document.body.len() > MAX_COLLAB_PARAGRAPHS {
+        return Err(StoreError::UnsupportedCollaborationDocument(format!(
+            "the body must contain between one and {MAX_COLLAB_PARAGRAPHS} top-level paragraphs"
+        )));
     }
-    let Some(paragraph) = document.body.first().and_then(|block| block.as_para()) else {
-        return Err(StoreError::UnsupportedCollaborationDocument("tables are not supported".into()));
-    };
-    let run_len = paragraph.runs.iter().try_fold(0usize, |total, run| total.checked_add(run.len));
-    let runs_cover_text = run_len == Some(paragraph.text.len());
-    if !paragraph.props.is_empty()
-        || !paragraph.mark.is_empty()
-        || paragraph.section.is_some()
-        || !paragraph.objects.is_empty()
-        || paragraph.text.contains('\n')
-        || paragraph.text.contains('\r')
-        || paragraph.text.chars().any(unsupported_collaboration_char)
-        || !runs_cover_text
-    {
-        return Err(StoreError::UnsupportedCollaborationDocument(
-            "paragraph formatting, pending mark formatting, inline objects, and section breaks are not supported".into(),
-        ));
-    }
-    if paragraph.text.len() > MAX_COLLAB_TEXT_BYTES {
-        return Err(StoreError::UnsupportedCollaborationDocument("the body paragraph exceeds the collaboration size limit".into()));
-    }
-    let mut byte_offset = 0usize;
-    for run in &paragraph.runs {
-        if !collaboration_run_props_are_supported(&run.props) {
+    let mut text_bytes = 0usize;
+    let mut paragraphs = Vec::with_capacity(document.body.len());
+    for block in &document.body {
+        let Some(paragraph) = block.as_para() else {
+            return Err(StoreError::UnsupportedCollaborationDocument("tables are not supported".into()));
+        };
+        let Some(next_text_bytes) = text_bytes.checked_add(paragraph.text.len()) else {
+            return Err(StoreError::UnsupportedCollaborationDocument("the body text size exceeds the collaboration limit".into()));
+        };
+        if next_text_bytes > MAX_COLLAB_TEXT_BYTES {
+            return Err(StoreError::UnsupportedCollaborationDocument("the body text exceeds the collaboration size limit".into()));
+        }
+        text_bytes = next_text_bytes;
+        let run_len = paragraph.runs.iter().try_fold(0usize, |total, run| total.checked_add(run.len));
+        let runs_cover_text = run_len == Some(paragraph.text.len());
+        if !paragraph.props.is_empty()
+            || !paragraph.mark.is_empty()
+            || paragraph.section.is_some()
+            || !paragraph.objects.is_empty()
+            || paragraph.text.contains('\n')
+            || paragraph.text.contains('\r')
+            || paragraph.text.chars().any(unsupported_collaboration_char)
+            || !runs_cover_text
+        {
             return Err(StoreError::UnsupportedCollaborationDocument(
-                "only direct bold, italic, and single underline character properties are supported".into(),
+                "paragraph formatting, pending mark formatting, inline objects, and section breaks are not supported".into(),
             ));
         }
-        let end = byte_offset
-            .checked_add(run.len)
-            .ok_or_else(|| StoreError::UnsupportedCollaborationDocument("run offsets exceed the body paragraph size".into()))?;
-        if paragraph.text.get(byte_offset..end).is_none() {
-            return Err(StoreError::UnsupportedCollaborationDocument("run boundaries must align with UTF-8 character boundaries".into()));
+        let mut byte_offset = 0usize;
+        for run in &paragraph.runs {
+            if !collaboration_run_props_are_supported(&run.props) {
+                return Err(StoreError::UnsupportedCollaborationDocument(
+                    "only direct bold, italic, and single underline character properties are supported".into(),
+                ));
+            }
+            let end = byte_offset
+                .checked_add(run.len)
+                .ok_or_else(|| StoreError::UnsupportedCollaborationDocument("run offsets exceed the paragraph size".into()))?;
+            if paragraph.text.get(byte_offset..end).is_none() {
+                return Err(StoreError::UnsupportedCollaborationDocument("run boundaries must align with UTF-8 character boundaries".into()));
+            }
+            byte_offset = end;
         }
-        byte_offset = end;
+        paragraphs.push(CollaborationParagraph { text: paragraph.text.clone(), runs: paragraph.runs.clone() });
     }
-    Ok((paragraph.text.clone(), paragraph.runs.clone()))
+    Ok(paragraphs)
 }
 
 fn collaboration_run_props_are_supported(props: &wordcraft_doc::CharProps) -> bool {
@@ -1081,32 +1110,44 @@ fn collaboration_attrs(props: &wordcraft_doc::CharProps) -> Attrs {
 }
 
 fn make_collaboration_seed(document: &wordcraft_doc::Document) -> Result<Vec<u8>, StoreError> {
-    let (text, runs) = collaboration_seed_content(document)?;
+    let paragraphs = collaboration_seed_content(document)?;
     let document = Doc::new();
-    let shared_text = document.get_or_insert_text(COLLAB_TEXT_ROOT);
+    let shared_texts: Vec<_> = (0..paragraphs.len())
+        .map(|index| {
+            let root = collaboration_text_root(index);
+            document.get_or_insert_text(root.as_str())
+        })
+        .collect();
     let mut transaction = document.transact_mut();
-    let mut byte_offset = 0usize;
-    let mut text_index = 0u32;
-    for run in runs {
-        let end = byte_offset
-            .checked_add(run.len)
-            .ok_or_else(|| StoreError::UnsupportedCollaborationDocument("run offsets exceed the body paragraph size".into()))?;
-        let chunk = text
-            .get(byte_offset..end)
-            .ok_or_else(|| StoreError::UnsupportedCollaborationDocument("run boundaries must align with UTF-8 character boundaries".into()))?;
-        if !chunk.is_empty() {
-            shared_text.insert_with_attributes(&mut transaction, text_index, chunk, collaboration_attrs(&run.props));
-            let byte_len = u32::try_from(chunk.len())
-                .map_err(|_| StoreError::UnsupportedCollaborationDocument("the body paragraph exceeds the Yrs text index range".into()))?;
-            text_index = text_index
-                .checked_add(byte_len)
-                .ok_or_else(|| StoreError::UnsupportedCollaborationDocument("the body paragraph exceeds the Yrs text index range".into()))?;
+    for (paragraph, shared_text) in paragraphs.iter().zip(shared_texts) {
+        let mut byte_offset = 0usize;
+        let mut text_index = 0u32;
+        for run in &paragraph.runs {
+            let end = byte_offset
+                .checked_add(run.len)
+                .ok_or_else(|| StoreError::UnsupportedCollaborationDocument("run offsets exceed the paragraph size".into()))?;
+            let chunk = paragraph
+                .text
+                .get(byte_offset..end)
+                .ok_or_else(|| StoreError::UnsupportedCollaborationDocument("run boundaries must align with UTF-8 character boundaries".into()))?;
+            if !chunk.is_empty() {
+                shared_text.insert_with_attributes(&mut transaction, text_index, chunk, collaboration_attrs(&run.props));
+                let byte_len = u32::try_from(chunk.len())
+                    .map_err(|_| StoreError::UnsupportedCollaborationDocument("paragraph exceeds the Yrs text index range".into()))?;
+                text_index = text_index
+                    .checked_add(byte_len)
+                    .ok_or_else(|| StoreError::UnsupportedCollaborationDocument("paragraph exceeds the Yrs text index range".into()))?;
+            }
+            byte_offset = end;
         }
-        byte_offset = end;
     }
     drop(transaction);
     let update = document.transact().encode_state_as_update_v1(&StateVector::default());
     Ok(update)
+}
+
+fn collaboration_text_root(index: usize) -> String {
+    if index == 0 { COLLAB_TEXT_ROOT.to_string() } else { format!("body:paragraph:{index}") }
 }
 
 fn unsupported_collaboration_char(character: char) -> bool {
@@ -1207,14 +1248,26 @@ where
     Ok(())
 }
 
-fn rebuild_collaboration_document(seed_update: &[u8], updates: &[StoredCollaborationUpdate], incoming_update: bool) -> Result<Doc, StoreError> {
+fn rebuild_collaboration_document(
+    seed_update: &[u8],
+    updates: &[StoredCollaborationUpdate],
+    paragraph_count: usize,
+    incoming_update: bool,
+) -> Result<Doc, StoreError> {
+    if paragraph_count == 0 || paragraph_count > MAX_COLLAB_PARAGRAPHS {
+        let error = StoreError::InvalidCollaborationState("collaboration paragraph count is outside the supported range".into());
+        return Err(error);
+    }
     let document = Doc::new();
-    let _ = document.get_or_insert_text(COLLAB_TEXT_ROOT);
+    for index in 0..paragraph_count {
+        let root = collaboration_text_root(index);
+        let _ = document.get_or_insert_text(root.as_str());
+    }
     apply_collaboration_update(&document, seed_update, incoming_update)?;
     for update in updates {
         apply_collaboration_update(&document, &update.bytes, incoming_update)?;
     }
-    validate_collaboration_state(&document, incoming_update)?;
+    validate_collaboration_state(&document, paragraph_count, incoming_update)?;
     Ok(document)
 }
 
@@ -1233,46 +1286,81 @@ fn apply_collaboration_update(document: &Doc, bytes: &[u8], incoming_update: boo
     result.map_err(|error| if incoming_update { StoreError::InvalidCollaborationUpdate(error) } else { StoreError::InvalidCollaborationState(error) })
 }
 
-fn validate_collaboration_state(document: &Doc, incoming_update: bool) -> Result<(), StoreError> {
-    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| collaboration_content(document).map(|_| ()))) {
+fn validate_collaboration_state(document: &Doc, paragraph_count: usize, incoming_update: bool) -> Result<(), StoreError> {
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| collaboration_content(document, paragraph_count).map(|_| ()))) {
         Ok(result) => result,
         Err(_) => Err("Yrs state failed guarded collaboration validation".to_string()),
     };
     result.map_err(|error| if incoming_update { StoreError::InvalidCollaborationUpdate(error) } else { StoreError::InvalidCollaborationState(error) })
 }
 
-fn collaboration_content(document: &Doc) -> Result<(String, Vec<wordcraft_doc::Run>), String> {
+fn collaboration_content(document: &Doc, paragraph_count: usize) -> Result<Vec<CollaborationParagraph>, String> {
+    if paragraph_count == 0 || paragraph_count > MAX_COLLAB_PARAGRAPHS {
+        return Err("collaboration paragraph count is outside the supported range".into());
+    }
     let transaction = document.transact();
-    let mut root = None;
+    let mut contents = (0..paragraph_count).map(|_| None).collect::<Vec<Option<CollaborationParagraph>>>();
+    let mut total_bytes = 0usize;
     for (name, value) in transaction.root_refs() {
-        match (name, value) {
-            (COLLAB_TEXT_ROOT, Out::YText(text)) if root.is_none() => root = Some(text),
-            _ => return Err("only the body:main text root is supported".into()),
+        let index = collaboration_root_index(name, paragraph_count)?;
+        if contents.get(index).is_none_or(Option::is_some) {
+            return Err(format!("collaboration text root {name} is duplicated"));
         }
-    }
-    let Some(text) = root else {
-        return Err("the body:main text root is missing".into());
-    };
-    let mut value = String::new();
-    let mut runs = Vec::new();
-    for chunk in text.diff(&transaction, |_| ()) {
-        let props = collaboration_char_props(chunk.attributes.as_deref())?;
-        let inserted = match chunk.insert {
-            Out::Any(Any::String(inserted)) => inserted,
-            _ => return Err("only string inserts with supported character properties are allowed".into()),
+        let Out::YText(text) = value else {
+            return Err(format!("collaboration root {name} must be a text sequence"));
         };
-        if value.len().saturating_add(inserted.len()) > MAX_COLLAB_TEXT_BYTES {
-            return Err("the body:main text exceeds the collaboration size limit".into());
+        let mut paragraph_text = String::new();
+        let mut runs = Vec::new();
+        for chunk in text.diff(&transaction, |_| ()) {
+            let props = collaboration_char_props(chunk.attributes.as_deref())?;
+            let inserted = match chunk.insert {
+                Out::Any(Any::String(inserted)) => inserted,
+                _ => return Err("only string inserts with supported character properties are allowed".into()),
+            };
+            let next_total = total_bytes
+                .checked_add(paragraph_text.len())
+                .and_then(|size| size.checked_add(inserted.len()))
+                .ok_or_else(|| "body text size exceeds the collaboration limit".to_string())?;
+            if next_total > MAX_COLLAB_TEXT_BYTES {
+                return Err("body text exceeds the collaboration size limit".into());
+            }
+            paragraph_text.push_str(&inserted);
+            if !inserted.is_empty() {
+                runs.push(wordcraft_doc::Run { len: inserted.len(), props });
+            }
         }
-        value.push_str(&inserted);
-        if !inserted.is_empty() {
-            runs.push(wordcraft_doc::Run { len: inserted.len(), props });
+        if paragraph_text.chars().any(unsupported_collaboration_char) {
+            return Err("control characters, inline objects, and paragraph or section breaks are not supported".into());
         }
+        total_bytes = total_bytes.checked_add(paragraph_text.len()).ok_or_else(|| "body text size exceeds the collaboration limit".to_string())?;
+        if total_bytes > MAX_COLLAB_TEXT_BYTES {
+            return Err("body text exceeds the collaboration size limit".into());
+        }
+        contents[index] = Some(CollaborationParagraph { text: paragraph_text, runs });
     }
-    if value.chars().any(unsupported_collaboration_char) {
-        return Err("control characters, inline objects, and paragraph or section breaks are not supported".into());
+    let mut paragraphs = Vec::with_capacity(paragraph_count);
+    for (index, content) in contents.into_iter().enumerate() {
+        let content = content.ok_or_else(|| format!("collaboration text root {} is missing", collaboration_text_root(index)))?;
+        paragraphs.push(content);
     }
-    Ok((value, runs))
+    Ok(paragraphs)
+}
+
+fn collaboration_root_index(name: &str, paragraph_count: usize) -> Result<usize, String> {
+    if name == COLLAB_TEXT_ROOT {
+        return Ok(0);
+    }
+    let Some(index_text) = name.strip_prefix("body:paragraph:") else {
+        return Err(format!("unknown collaboration text root {name}"));
+    };
+    let index = index_text.parse::<usize>().map_err(|_| format!("unknown collaboration text root {name}"))?;
+    if index >= paragraph_count {
+        return Err(format!("collaboration text root {name} is out of range"));
+    }
+    if index == 0 || collaboration_text_root(index) != name {
+        return Err(format!("unknown collaboration text root {name}"));
+    }
+    Ok(index)
 }
 
 fn collaboration_char_props(attributes: Option<&Attrs>) -> Result<wordcraft_doc::CharProps, String> {
@@ -1475,6 +1563,45 @@ mod tests {
         (doc, text)
     }
 
+    fn collaboration_client_with_paragraphs(seed: &[u8], client_id: u64, paragraph_count: usize) -> (Doc, Vec<TextRef>) {
+        let doc = Doc::with_options(Options::with_client_id(ClientID::new(client_id)));
+        let texts: Vec<_> = (0..paragraph_count)
+            .map(|index| {
+                let root = super::collaboration_text_root(index);
+                doc.get_or_insert_text(root.as_str())
+            })
+            .collect();
+        let update = Update::decode_v1(seed).expect("seed update decodes");
+        doc.transact_mut().apply_update(update).expect("seed update applies");
+        (doc, texts)
+    }
+
+    fn client_insert_in_paragraph(
+        seed: &[u8],
+        client_id: u64,
+        paragraph_count: usize,
+        paragraph_index: usize,
+        offset: u32,
+        insertion: &str,
+        attrs: Attrs,
+    ) -> Vec<u8> {
+        let (doc, texts) = collaboration_client_with_paragraphs(seed, client_id, paragraph_count);
+        let text = texts.get(paragraph_index).expect("paragraph root exists");
+        let mut transaction = doc.transact_mut();
+        text.insert_with_attributes(&mut transaction, offset, insertion, attrs);
+        transaction.encode_update_v1()
+    }
+
+    fn client_insert_at_root(seed: &[u8], client_id: u64, root_name: &str, insertion: &str) -> Vec<u8> {
+        let doc = Doc::with_options(Options::with_client_id(ClientID::new(client_id)));
+        let update = Update::decode_v1(seed).expect("seed update decodes");
+        doc.transact_mut().apply_update(update).expect("seed update applies");
+        let text = doc.get_or_insert_text(root_name);
+        let mut transaction = doc.transact_mut();
+        text.insert(&mut transaction, 0, insertion);
+        transaction.encode_update_v1()
+    }
+
     fn client_insert(seed: &[u8], client_id: u64, insertion: &str) -> Vec<u8> {
         let (doc, text) = collaboration_client(seed, client_id);
         let mut transaction = doc.transact_mut();
@@ -1528,6 +1655,20 @@ mod tests {
         document
     }
 
+    fn multi_paragraph_seed_document() -> Document {
+        let mut first = Paragraph::with_text("甲乙", CharProps::default());
+        first.runs = vec![Run { len: 3, props: CharProps { bold: Some(true), ..CharProps::default() } }, Run { len: 3, props: CharProps::default() }];
+        let mut second = Paragraph::with_text("A😀B", CharProps::default());
+        second.runs = vec![
+            Run { len: 1, props: CharProps::default() },
+            Run { len: 4, props: CharProps { italic: Some(true), ..CharProps::default() } },
+            Run { len: 1, props: CharProps::default() },
+        ];
+        let mut document = Document::new();
+        document.body = vec![para_block(first), para_block(second)];
+        document
+    }
+
     fn snapshot_text(store: &Store, id: &str) -> String {
         let record = store.get(id).expect("document is stored");
         wordcraft_engine::io::document_from_storage_snapshot(&record.snapshot).expect("stored snapshot decodes").plain_text(StoryRef::Body)
@@ -1566,6 +1707,156 @@ mod tests {
         assert_eq!(last_attrs.get("wc.underline"), Some(&Any::Bool(false)));
         drop(transaction);
         drop(room);
+        drop(store);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multi_paragraph_roots_seed_independent_updates_converge_and_preserve_snapshot_runs() {
+        let path = test_path("collab-multi-paragraph");
+        let store = Store::open(&path).expect("store opens");
+        let created = store
+            .create("Collaborative paragraphs", wordcraft_engine::io::storage_snapshot(&multi_paragraph_seed_document()).expect("snapshot"))
+            .expect("document creates");
+        let rooms = super::CollaborationRooms::default();
+        let room = rooms.get_or_load(&store, &created.summary.id).expect("multi-paragraph collaboration room seeds");
+        assert_eq!(room.paragraph_count, 2);
+
+        let (alice, alice_texts) = collaboration_client_with_paragraphs(&room.seed_update, 901, 2);
+        let (bob, bob_texts) = collaboration_client_with_paragraphs(&room.seed_update, 902, 2);
+        let alice_update = client_insert_in_paragraph(&room.seed_update, 901, 2, 0, 3, "X", Attrs::from([("wc.underline".into(), true.into())]));
+        let bob_update = client_insert_in_paragraph(&room.seed_update, 902, 2, 1, 1, "Y", Attrs::from([("wc.underline".into(), true.into())]));
+
+        assert!(room.accept_update(&store, &alice_update).expect("first paragraph update persists"));
+        assert!(room.accept_update(&store, &bob_update).expect("second paragraph update persists"));
+        let full_state = room.full_state().expect("full multi-paragraph state encodes");
+        alice.transact_mut().apply_update(Update::decode_v1(&full_state).expect("full state decodes")).expect("Alice receives merged state");
+        bob.transact_mut().apply_update(Update::decode_v1(&full_state).expect("full state decodes")).expect("Bob receives merged state");
+
+        let alice_transaction = alice.transact();
+        let alice_values: Vec<_> = alice_texts.iter().map(|text| text.get_string(&alice_transaction)).collect();
+        drop(alice_transaction);
+        let bob_transaction = bob.transact();
+        let bob_values: Vec<_> = bob_texts.iter().map(|text| text.get_string(&bob_transaction)).collect();
+        drop(bob_transaction);
+        assert_eq!(alice_values, vec!["甲X乙", "AY😀B"]);
+        assert_eq!(bob_values, alice_values, "clients converge on both independent roots");
+
+        let record = store.get(&created.summary.id).expect("materialized document loads");
+        assert_eq!(record.summary.version, 1, "live paragraph updates do not create REST versions");
+        let document = wordcraft_engine::io::document_from_storage_snapshot(&record.snapshot).expect("snapshot decodes");
+        assert_eq!(document.body.len(), 2, "materialization preserves paragraph count and order");
+        assert_eq!(document.core.title, "Collaborative paragraphs", "materialization preserves document metadata");
+        let first = document.body.first().and_then(|block| block.as_para()).expect("first paragraph remains in place");
+        let second = document.body.get(1).and_then(|block| block.as_para()).expect("second paragraph remains in place");
+        assert_eq!(first.text, "甲X乙");
+        assert!(first.runs.iter().any(|run| run.props.bold == Some(true)), "first paragraph keeps seeded bold");
+        assert!(first.runs.iter().any(|run| run.props.underline == Some(Underline::Single)), "first paragraph stores its new underline run");
+        assert_eq!(second.text, "AY😀B");
+        assert!(second.runs.iter().any(|run| run.props.italic == Some(true)), "second paragraph keeps seeded italic");
+        assert!(second.runs.iter().any(|run| run.props.underline == Some(Underline::Single)), "second paragraph stores its new underline run");
+        drop(room);
+        drop(rooms);
+        drop(store);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn empty_paragraph_root_preserves_its_fixed_position() {
+        let path = test_path("collab-empty-paragraph-root");
+        let store = Store::open(&path).expect("store opens");
+        let created = store
+            .create(
+                "Paragraphs with a blank line",
+                wordcraft_engine::io::storage_snapshot(&Document::from_text("before\n\nafter")).expect("snapshot"),
+            )
+            .expect("document creates");
+        let rooms = super::CollaborationRooms::default();
+        let room = rooms.get_or_load(&store, &created.summary.id).expect("room seeds all paragraph roots");
+        assert_eq!(room.paragraph_count, 3);
+        let update = client_insert_in_paragraph(&room.seed_update, 905, 3, 1, 0, "middle", Attrs::new());
+        assert!(room.accept_update(&store, &update).expect("empty paragraph root accepts text"));
+
+        let record = store.get(&created.summary.id).expect("materialized snapshot loads");
+        let document = wordcraft_engine::io::document_from_storage_snapshot(&record.snapshot).expect("snapshot decodes");
+        assert_eq!(document.body.len(), 3, "editing an empty paragraph does not shift following paths");
+        assert_eq!(document.body.first().and_then(|block| block.as_para()).expect("first paragraph exists").text, "before");
+        assert_eq!(document.body.get(1).and_then(|block| block.as_para()).expect("middle paragraph exists").text, "middle");
+        assert_eq!(document.body.get(2).and_then(|block| block.as_para()).expect("last paragraph exists").text, "after");
+        drop(room);
+        drop(rooms);
+        drop(store);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multi_paragraph_collaboration_replays_after_store_reopen() {
+        let path = test_path("collab-multi-paragraph-reopen");
+        let document_id;
+        {
+            let store = Store::open(&path).expect("store opens");
+            let created = store
+                .create("Two paragraphs", wordcraft_engine::io::storage_snapshot(&Document::from_text("one\ntwo")).expect("snapshot"))
+                .expect("document creates");
+            document_id = created.summary.id.clone();
+            let rooms = super::CollaborationRooms::default();
+            let room = rooms.get_or_load(&store, &document_id).expect("room seeds");
+            let first_update = client_insert_in_paragraph(&room.seed_update, 911, 2, 0, 3, "X", Attrs::new());
+            let second_update = client_insert_in_paragraph(&room.seed_update, 912, 2, 1, 3, "Y", Attrs::new());
+            assert!(room.accept_update(&store, &first_update).expect("first root update persists"));
+            assert!(room.accept_update(&store, &second_update).expect("second root update persists"));
+            drop(room);
+            drop(rooms);
+        }
+
+        let reopened = Store::open(&path).expect("store reopens");
+        let rooms = super::CollaborationRooms::default();
+        let room = rooms.get_or_load(&reopened, &document_id).expect("multi-paragraph update log replays");
+        assert_eq!(room.paragraph_count, 2, "fixed paragraph count is recovered from the materialized snapshot");
+        let (client, texts) = collaboration_client_with_paragraphs(&room.seed_update, 913, room.paragraph_count);
+        client
+            .transact_mut()
+            .apply_update(Update::decode_v1(&room.full_state().expect("replayed state encodes")).expect("replayed state decodes"))
+            .expect("replayed state applies");
+        let transaction = client.transact();
+        assert_eq!(texts.first().expect("first root exists").get_string(&transaction), "oneX");
+        assert_eq!(texts.get(1).expect("second root exists").get_string(&transaction), "twoY");
+        drop(transaction);
+        let record = reopened.get(&document_id).expect("reopened materialized document loads");
+        let snapshot = wordcraft_engine::io::document_from_storage_snapshot(&record.snapshot).expect("reopened snapshot decodes");
+        assert_eq!(snapshot.body.len(), 2);
+        assert_eq!(snapshot.body.first().and_then(|block| block.as_para()).expect("first paragraph exists").text, "oneX");
+        assert_eq!(snapshot.body.get(1).and_then(|block| block.as_para()).expect("second paragraph exists").text, "twoY");
+        drop(room);
+        drop(rooms);
+        drop(reopened);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn unknown_and_out_of_range_paragraph_roots_are_rejected_before_storage() {
+        let path = test_path("collab-multi-paragraph-roots");
+        let store = Store::open(&path).expect("store opens");
+        let created = store
+            .create("Two paragraphs", wordcraft_engine::io::storage_snapshot(&Document::from_text("first\nsecond")).expect("snapshot"))
+            .expect("document creates");
+        let rooms = super::CollaborationRooms::default();
+        let room = rooms.get_or_load(&store, &created.summary.id).expect("room seeds");
+
+        let out_of_range = client_insert_at_root(&room.seed_update, 921, "body:paragraph:2", "X");
+        let error = room.accept_update(&store, &out_of_range).expect_err("third paragraph root is rejected");
+        assert!(error.to_string().contains("out of range"));
+        let unknown = client_insert_at_root(&room.seed_update, 922, "body:unknown", "Y");
+        assert!(matches!(room.accept_update(&store, &unknown), Err(StoreError::InvalidCollaborationUpdate(_))));
+
+        assert!(store.load_or_seed_collaboration(&created.summary.id).expect("durable state remains valid").updates.is_empty());
+        let record = store.get(&created.summary.id).expect("snapshot remains available");
+        let document = wordcraft_engine::io::document_from_storage_snapshot(&record.snapshot).expect("snapshot remains valid");
+        assert_eq!(document.body.len(), 2);
+        assert_eq!(document.body.first().and_then(|block| block.as_para()).expect("first paragraph exists").text, "first");
+        assert_eq!(document.body.get(1).and_then(|block| block.as_para()).expect("second paragraph exists").text, "second");
+        drop(room);
+        drop(rooms);
         drop(store);
         cleanup(&path);
     }
@@ -1966,11 +2257,13 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_documents_are_not_seeded_and_collaboration_fences_snapshot_writes() {
+    fn oversized_or_unsupported_documents_are_not_seeded_and_collaboration_fences_snapshot_writes() {
         let path = test_path("collab-scope");
         let store = Store::open(&path).expect("store opens");
+        let mut too_many_paragraphs = Document::new();
+        too_many_paragraphs.body = (0..=super::MAX_COLLAB_PARAGRAPHS).map(|_| para_block(Paragraph::new())).collect();
         let unsupported = store
-            .create("Two paragraphs", wordcraft_engine::io::storage_snapshot(&Document::from_text("first\nsecond")).expect("snapshot"))
+            .create("Too many paragraphs", wordcraft_engine::io::storage_snapshot(&too_many_paragraphs).expect("snapshot"))
             .expect("document creates");
         assert!(matches!(store.load_or_seed_collaboration(&unsupported.summary.id), Err(StoreError::UnsupportedCollaborationDocument(_))));
 
