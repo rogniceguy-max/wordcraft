@@ -24,3 +24,6 @@ thiserror = { workspace = true }
 log = { workspace = true }
 regex = { workspace = true }
 image = { workspace = true }
+
+[dev-dependencies]
+yrs = { workspace = true }
