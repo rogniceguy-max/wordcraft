@@ -242,7 +242,13 @@ fn export_page(app: &mut WordApp, ui: &mut Ui) {
             let name = format!("{}.{ext}", app.title_stem());
             let picked = app.services.pick_save.as_ref().and_then(|f| f(&name));
             if let Some(path) = picked {
-                let r = if ext == "png" { app.run("file.exportPng", json!({"path": path})) } else { app.run("file.saveAs", json!({"path": path})) };
+                let r = if ext == "png" {
+                    app.run("file.exportPng", json!({"path": path}))
+                } else if app.services.download.is_some() {
+                    app.download_export(&path)
+                } else {
+                    app.run("file.saveAs", json!({"path": path}))
+                };
                 if r.is_ok() {
                     app.status(crate::i18n::fmt(tl!("Exported {path}"), &[("path", &path)]));
                 }
@@ -266,6 +272,10 @@ fn options_page(app: &mut WordApp, ui: &mut Ui) {
     let mut dark = app.ui.dark;
     if ui.checkbox(&mut dark, tl!("Dark mode")).changed() {
         let _ = app.run("ui.dark", json!({"value": dark}));
+    }
+    let mut black_pages = app.ui.black_pages;
+    if ui.checkbox(&mut black_pages, tl!("Pure black page display")).changed() {
+        let _ = app.run("ui.blackPages", json!({"value": black_pages}));
     }
     ui.checkbox(&mut app.autosave, tl!("AutoSave documents that have been saved"));
     ui.checkbox(&mut app.ui.show_discord, tl!("Show the community button in the title bar"));

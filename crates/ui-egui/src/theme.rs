@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, Visuals};
 
+const BLACK_PAGE_DISPLAY_ID: &str = "wordcraft.black-page-display";
+
 /// WordCraft's app colour (and its darker ink for text on light backgrounds).
 pub const APP_COLOR: Color32 = Color32::from_rgb(0x3B, 0x5B, 0xDB);
 pub const APP_INK: Color32 = Color32::from_rgb(0x2B, 0x47, 0xB5);
@@ -119,7 +121,18 @@ impl Tokens {
         }
     }
     pub fn get(ctx: &egui::Context) -> Tokens {
-        if ctx.global_style().visuals.dark_mode { Tokens::dark() } else { Tokens::light() }
+        let mut tokens = if ctx.global_style().visuals.dark_mode { Tokens::dark() } else { Tokens::light() };
+        let black_page = ctx.data(|data| data.get_temp::<bool>(egui::Id::new(BLACK_PAGE_DISPLAY_ID)).unwrap_or(false));
+        if black_page {
+            tokens.canvas = Color32::BLACK;
+            tokens.caret = Color32::WHITE;
+        }
+        tokens
+    }
+
+    /// Make the editor work area and caret match the display-only black page mode.
+    pub fn set_black_page_display(ctx: &egui::Context, enabled: bool) {
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new(BLACK_PAGE_DISPLAY_ID), enabled));
     }
 }
 
@@ -228,4 +241,25 @@ pub fn apply(ctx: &egui::Context, t: &Tokens) {
 
 pub fn c32(c: wordcraft_doc::Rgb) -> Color32 {
     Color32::from_rgb(c.0, c.1, c.2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Tokens;
+
+    #[test]
+    fn black_page_mode_changes_only_work_area_and_caret_tokens() {
+        let ctx = egui::Context::default();
+        let before = Tokens::get(&ctx);
+        Tokens::set_black_page_display(&ctx, true);
+        let black = Tokens::get(&ctx);
+
+        assert_eq!(black.canvas, egui::Color32::BLACK);
+        assert_eq!(black.caret, egui::Color32::WHITE);
+        assert_eq!(black.panel, before.panel);
+        assert_eq!(black.text, before.text);
+
+        Tokens::set_black_page_display(&ctx, false);
+        assert_eq!(Tokens::get(&ctx).canvas, before.canvas);
+    }
 }

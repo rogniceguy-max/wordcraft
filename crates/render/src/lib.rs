@@ -9,7 +9,7 @@ use vello_cpu::peniko;
 use vello_cpu::{Pixmap, RenderContext, Resources};
 use wordcraft_doc::Document;
 use wordcraft_doc::para::ShapeKind;
-use wordcraft_doc::props::Rgb;
+use wordcraft_doc::props::{Rgb, TextColor};
 use wordcraft_fonts::FontDb;
 use wordcraft_layout::Page;
 use wordcraft_layout::display::{DisplayOptions, Draw, Stroke, page_display};
@@ -152,13 +152,16 @@ pub struct RenderOptions {
     pub display: DisplayOptions,
     /// Paper colour (page colour from Design › Page Color, else white).
     pub paper: Rgb,
+    /// Render a black page for display only, resolving automatic text to white.
+    /// Explicit document colours and the document itself are left unchanged.
+    pub black_page: bool,
     /// Colour for formatting marks.
     pub mark_color: Rgb,
 }
 
 impl Default for RenderOptions {
     fn default() -> Self {
-        RenderOptions { display: DisplayOptions::default(), paper: Rgb::WHITE, mark_color: Rgb(0x2B, 0x57, 0x9A) }
+        RenderOptions { display: DisplayOptions::default(), paper: Rgb::WHITE, black_page: false, mark_color: Rgb(0x2B, 0x57, 0x9A) }
     }
 }
 
@@ -175,9 +178,10 @@ pub fn render_region(doc: &Document, page: &Page, w: u32, h: u32, view: Affine, 
     let (w16, h16) = (w.clamp(1, MAX_SIDE) as u16, h.clamp(1, MAX_SIDE) as u16);
     let mut ctx = RenderContext::new_with(w16, h16, vello_cpu::RenderSettings { num_threads: default_threads(), ..Default::default() });
     ctx.set_transform(Affine::IDENTITY);
-    ctx.set_paint(color(doc.settings.page_color.unwrap_or(opts.paper), 1.0));
+    let paper = if opts.black_page { Rgb::BLACK } else { doc.settings.page_color.unwrap_or(opts.paper) };
+    ctx.set_paint(color(paper, 1.0));
     ctx.fill_rect(&kurbo::Rect::new(0.0, 0.0, w16 as f64, h16 as f64));
-    let items = page_display(doc, page, &opts.display);
+    let items = display_items(doc, page, opts);
     let visible = view.inverse().transform_rect_bbox(kurbo::Rect::new(0.0, 0.0, w16 as f64, h16 as f64)).inflate(40.0, 40.0);
     if let Some(wm) = &doc.settings.watermark {
         draw_watermark(&mut ctx, view, page, wm);
@@ -192,6 +196,32 @@ pub fn render_region(doc: &Document, page: &Page, w: u32, h: u32, view: Affine, 
         ctx.render(pm, &mut res);
     }
     Rendered { width: w16 as u32, height: h16 as u32, pixels }
+}
+
+/// Make a display-only page snapshot for black-paper rendering. Auto colours belong to the
+/// document's viewing context, so resolve those runs to white in the cloned layout records;
+/// fixed RGB colours and every document-owned value remain untouched.
+fn display_items(doc: &Document, page: &Page, opts: &RenderOptions) -> Vec<Draw> {
+    if !opts.black_page {
+        return page_display(doc, page, &opts.display);
+    }
+
+    let mut display_page = page.clone();
+    for item in display_page.items.iter_mut().chain(display_page.header.iter_mut()).chain(display_page.footer.iter_mut()) {
+        let wordcraft_layout::Placed::Lines { para, .. } = item else { continue };
+        if !para.styles.iter().any(|style| style.rc.color == TextColor::Auto) {
+            continue;
+        }
+        let para = Arc::make_mut(para);
+        for style in &mut para.styles {
+            if style.rc.color == TextColor::Auto {
+                let mut rc = style.rc.as_ref().clone();
+                rc.color = TextColor::Rgb(Rgb::WHITE);
+                style.rc = Arc::new(rc);
+            }
+        }
+    }
+    page_display(doc, &display_page, &opts.display)
 }
 
 fn draw_watermark(ctx: &mut RenderContext, view: Affine, page: &Page, wm: &wordcraft_doc::Watermark) {
@@ -444,6 +474,9 @@ pub fn render_area(doc: &Document, page: &Page, x: f32, y: f32, w: f32, h: f32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wordcraft_doc::para::Paragraph;
+    use wordcraft_doc::props::CharProps;
+    use wordcraft_doc::{TextColor, para_block};
     use wordcraft_layout::{LayoutCache, LayoutOptions, layout};
 
     #[test]
@@ -468,6 +501,56 @@ mod tests {
         let big = render_page(&d, &l.pages[0], 1e9, &RenderOptions::default());
         assert!(big.width <= MAX_SIDE);
         assert!(decode_pixmap(b"not an image").is_none());
+    }
+
+    #[test]
+    fn black_page_preview_preserves_document_and_default_export_colors() {
+        let mut doc = Document::from_text("Preview only");
+        doc.settings.page_color = Some(Rgb(0xD2, 0xD4, 0xD6));
+        let original = doc.clone();
+        let layout = layout(&doc, &mut LayoutCache::new(), &LayoutOptions::default());
+        let page = &layout.pages[0];
+
+        let default = render_page(&doc, page, 1.0, &RenderOptions::default());
+        let black = render_page(&doc, page, 1.0, &RenderOptions { black_page: true, ..RenderOptions::default() });
+        let default_after_preview = render_page(&doc, page, 1.0, &RenderOptions::default());
+
+        assert_eq!(doc, original);
+        assert_eq!(black.pixel(5, 5), [0x00, 0x00, 0x00, 0xFF]);
+        assert_eq!(default.pixel(5, 5), [0xD2, 0xD4, 0xD6, 0xFF]);
+        assert_eq!(default_after_preview.pixel(5, 5), default.pixel(5, 5));
+    }
+
+    #[test]
+    fn black_page_preview_recolors_only_automatic_text() {
+        let explicit = Rgb(0x24, 0x68, 0xAC);
+        let mut doc = Document::new();
+        doc.body = vec![
+            para_block(Paragraph::with_text("Automatic", CharProps::default())),
+            para_block(Paragraph::with_text("Explicit", CharProps { color: Some(TextColor::Rgb(explicit)), ..CharProps::default() })),
+        ];
+        let layout = layout(&doc, &mut LayoutCache::new(), &LayoutOptions::default());
+        let page = &layout.pages[0];
+        let opts = RenderOptions { black_page: true, ..RenderOptions::default() };
+
+        let colors: Vec<Rgb> = display_items(&doc, page, &opts)
+            .into_iter()
+            .filter_map(|item| match item {
+                Draw::Glyphs { color, .. } => Some(color),
+                _ => None,
+            })
+            .collect();
+        let normal_colors: Vec<Rgb> = display_items(&doc, page, &RenderOptions::default())
+            .into_iter()
+            .filter_map(|item| match item {
+                Draw::Glyphs { color, .. } => Some(color),
+                _ => None,
+            })
+            .collect();
+
+        assert!(colors.contains(&Rgb::WHITE), "automatic text should be white on the black page");
+        assert!(colors.contains(&explicit), "explicit RGB text colour should be preserved");
+        assert!(normal_colors.contains(&Rgb::BLACK), "black-page rendering must not change the cached layout");
     }
 
     #[test]

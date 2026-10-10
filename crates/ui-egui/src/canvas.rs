@@ -127,6 +127,7 @@ fn page_key(app: &WordApp, page: &Page, scale_px: f32) -> u64 {
     let editing_hf = matches!(app.session.sel.focus.story, StoryRef::Part(id) if Some(id) == page.header_story || Some(id) == page.footer_story);
     editing_hf.hash(&mut h);
     format!("{:?}{:?}", app.session.doc.settings.page_color, app.session.doc.settings.watermark).hash(&mut h);
+    app.ui.black_pages.hash(&mut h);
     (page.w.to_bits(), page.h.to_bits()).hash(&mut h);
     for list in [&page.items, &page.header, &page.footer] {
         list.len().hash(&mut h);
@@ -204,17 +205,22 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             let Some(page) = layout.pages.get(i) else { continue };
             // Shadow and paper.
             painter.rect_filled(sr.translate(vec2(0.0, 2.0)).expand(1.5), 1.0, t.page_shadow);
-            painter.rect_filled(sr, 0.0, Color32::WHITE);
+            painter.rect_filled(sr, 0.0, if app.ui.black_pages { Color32::BLACK } else { Color32::WHITE });
             let scale_px = (geo.scale * ppp).min(max_tex / page.w.max(1.0)).min(max_tex / page.h.clamp(1.0, 1e6)).max(0.05);
             let key = page_key(app, page, scale_px);
             let fresh = app.canvas.textures.get(&i).is_some_and(|(k, _)| *k == key);
             if !fresh && (rendered < 2 || !app.canvas.textures.contains_key(&i) && rendered < 4) {
-                let mut opts = wordcraft_render::RenderOptions::default();
-                opts.display.marks = app.session.view.marks;
-                opts.display.markup = app.session.view.show_markup;
                 let editing_hf = matches!(app.session.sel.focus.story, StoryRef::Part(_));
-                opts.display.dim_header = !editing_hf;
-                opts.display.dim_body = editing_hf;
+                let opts = wordcraft_render::RenderOptions {
+                    black_page: app.ui.black_pages,
+                    display: wordcraft_layout::display::DisplayOptions {
+                        marks: app.session.view.marks,
+                        markup: app.session.view.show_markup,
+                        dim_header: !editing_hf,
+                        dim_body: editing_hf,
+                    },
+                    ..Default::default()
+                };
                 let img = wordcraft_render::render_page(&app.session.doc, page, scale_px, &opts);
                 let px = img.to_straight();
                 let ci = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &px);
@@ -804,5 +810,24 @@ fn context_menu(app: &mut WordApp, ui: &mut Ui) {
             item(ui, app, "Delete Table", "table.deleteTable", json!({}));
         });
         item(ui, app, "Merge Cells", "table.merge", json!({}));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn black_page_toggle_invalidates_cached_page_texture() {
+        let session = wordcraft_engine::Session::new(wordcraft_doc::Document::new());
+        let mut app = WordApp::new(session, crate::Services::default());
+        let layout = app.session.layout();
+        let page = &layout.pages[0];
+
+        let normal = page_key(&app, page, 1.0);
+        app.ui.black_pages = true;
+        let black = page_key(&app, page, 1.0);
+
+        assert_ne!(normal, black);
     }
 }

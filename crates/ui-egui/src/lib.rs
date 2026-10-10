@@ -47,7 +47,9 @@ pub struct Services {
     /// Web: files (name, bytes) delivered asynchronously (picker, drag and drop).
     pub inbox: Option<Inbox>,
     /// Web: hand bytes to the browser as a download.
-    pub download: Option<Box<dyn Fn(&str, &[u8])>>,
+    pub download: Option<Box<dyn Fn(&str, &[u8]) -> Result<(), String>>>,
+    /// Web: request a durable shared-server save. `Some(name)` creates a new server document.
+    pub server_save: Option<Box<dyn Fn(Option<&str>, &wordcraft_doc::Document, u64)>>,
 }
 
 /// Files delivered asynchronously.
@@ -63,6 +65,8 @@ pub struct UiState {
     pub ribbon_collapsed: bool,
     pub recent: Vec<String>,
     pub dark: bool,
+    /// Show document pages as black in the editing canvas without changing document colours.
+    pub black_pages: bool,
     pub nav_tab: String,
     pub show_discord: bool,
     /// User name (File › Options) for comments and tracked changes; empty keeps the default.
@@ -82,6 +86,7 @@ impl Default for UiState {
             ribbon_collapsed: false,
             recent: Vec::new(),
             dark: false,
+            black_pages: false,
             nav_tab: "headings".into(),
             show_discord: true,
             author: String::new(),
@@ -175,15 +180,47 @@ impl WordApp {
         if let Some(r) = self.ui_command(id, &params) {
             return r;
         }
-        // Web: saving and exporting become downloads.
+        if id == "file.saveAs" && params.get("path").and_then(Value::as_str).is_none() && self.services.server_save.is_some() {
+            self.save_as_dialog();
+            return Ok(json!({"saved": false, "target": "server"}));
+        }
+        // Web: Save and Save As target the server; downloads remain a separate export action.
+        if matches!(id, "file.save" | "file.saveAs")
+            && let Some(save) = &self.services.server_save
+        {
+            let new_name = params.get("path").and_then(Value::as_str);
+            save(new_name, &self.session.doc, self.session.rev());
+            self.status(if new_name.is_some() { "Creating a shared server document…" } else { "Saving to the shared server…" });
+            return Ok(json!({"queued": true, "target": "server"}));
+        }
+        // Web: formats the existing document and asks the browser to download the result.
         if self.services.download.is_some() && matches!(id, "file.save" | "file.saveAs" | "file.exportPdf" | "file.exportPng") {
-            let name = params.get("path").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("{}.docx", self.title_stem()));
-            let name = if id == "file.exportPdf" && !name.ends_with(".pdf") { format!("{name}.pdf") } else { name };
-            let bytes = wordcraft_engine::io::save_bytes(&name, &self.session.doc)?;
-            if let Some(d) = &self.services.download {
-                d(&name, &bytes);
+            let extension = match id {
+                "file.exportPdf" => "pdf",
+                "file.exportPng" => "png",
+                _ => "docx",
+            };
+            let name = params.get("path").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("{}.{extension}", self.title_stem()));
+            let name = if id == "file.exportPdf" && !name.to_ascii_lowercase().ends_with(".pdf") { format!("{name}.pdf") } else { name };
+            let bytes = if id == "file.exportPng" {
+                let page = params.get("page").and_then(Value::as_u64).unwrap_or(1).max(1).saturating_sub(1);
+                let page = usize::try_from(page).unwrap_or(usize::MAX);
+                let scale = params
+                    .get("scale")
+                    .and_then(Value::as_f64)
+                    .map(|value| value as f32)
+                    .filter(|value| value.is_finite())
+                    .unwrap_or(2.0)
+                    .clamp(0.1, 8.0);
+                wordcraft_engine::io::render_png(&self.session.doc, page, scale)?
+            } else {
+                wordcraft_engine::io::save_bytes(&name, &self.session.doc)?
+            };
+            let Some(download) = &self.services.download else { return Err("browser download is unavailable".into()) };
+            if let Err(error) = download(&name, &bytes) {
+                self.status(format!("Download failed: {error}"));
+                return Err(error);
             }
-            self.session.dirty = false;
             return Ok(json!({"downloaded": name, "bytes": bytes.len()}));
         }
         let r = self.session.run(id, &params).map_err(|e| e.to_string());
@@ -192,6 +229,19 @@ impl WordApp {
             self.status(e.clone());
         }
         r
+    }
+
+    /// Export a copy through the host's download service without changing save state.
+    pub fn download_export(&mut self, name: &str) -> Result<Value, String> {
+        let bytes = wordcraft_engine::io::save_bytes(name, &self.session.doc)?;
+        let Some(download) = &self.services.download else {
+            return Err("browser download is unavailable".into());
+        };
+        if let Err(error) = download(name, &bytes) {
+            self.status(format!("Download failed: {error}"));
+            return Err(error);
+        }
+        Ok(json!({"downloaded": name, "bytes": bytes.len()}))
     }
 
     fn after_command(&mut self, id: &str) {
@@ -274,6 +324,10 @@ impl WordApp {
             "ui.dark" => {
                 self.ui.dark = p.get("value").and_then(Value::as_bool).unwrap_or(!self.ui.dark);
                 json!({"dark": self.ui.dark})
+            }
+            "ui.blackPages" => {
+                self.ui.black_pages = p.get("value").and_then(Value::as_bool).unwrap_or(!self.ui.black_pages);
+                json!({"blackPages": self.ui.black_pages})
             }
             "ui.language" => {
                 // `auto` (follow the system) or a language code; anything else is an error.
@@ -368,6 +422,7 @@ impl WordApp {
             theme::apply(ctx, &if dark { theme::Tokens::dark() } else { theme::Tokens::light() });
             self.applied_dark = Some(dark);
         }
+        theme::Tokens::set_black_page_display(ctx, self.ui.black_pages);
         self.drain_control(ctx);
         self.drain_inbox();
         // AutoSave: write a saved document a couple of seconds after the last change.
@@ -419,8 +474,10 @@ impl WordApp {
         raw.events.extend(self.synthetic.drain(..n));
     }
 
-    /// Lay out the window.
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    /// Draw the editor UI and report whether it was ready to render this pass.
+    /// Hosts with additional egui overlays should wait until this returns `true`, because the
+    /// first one or two passes install the custom font definitions used by the editor styles.
+    pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
         let t0 = now_ms();
         let ctx = ui.ctx().clone();
         i18n::set_current(i18n::Lang::from_pref(&self.ui.language));
@@ -428,7 +485,7 @@ impl WordApp {
         if self.fonts_frames < 2 {
             self.fonts_frames += 1;
             ctx.request_repaint();
-            return;
+            return false;
         }
         let t = theme::Tokens::get(&ctx);
         if self.ui.backstage {
@@ -447,9 +504,12 @@ impl WordApp {
         if let Some(url) = self.canvas.open_url.take() {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
+        #[cfg(not(target_arch = "wasm32"))]
         let title = format!("{}{} - WordCraft", self.title_stem(), if self.session.dirty { " •" } else { "" });
+        #[cfg(not(target_arch = "wasm32"))]
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         self.frame_ms = now_ms() - t0;
+        true
     }
 
     /// Files that arrived asynchronously (web picker, drops): documents open, pictures insert.
@@ -578,14 +638,16 @@ mod tests {
     }
 
     #[test]
-    fn user_name_survives_restart() {
+    fn user_name_and_page_appearance_survive_restart() {
         let mut first = app();
         first.run("file.setAuthor", json!({"name": "Ada Lovelace"})).unwrap();
+        first.run("ui.blackPages", json!({"value": true})).unwrap();
         let saved = serde_json::to_vec(&first.prefs()).unwrap();
 
         let mut second = app();
         second.apply_prefs(serde_json::from_slice(&saved).unwrap());
         assert_eq!(second.session.author, "Ada Lovelace");
+        assert!(second.ui.black_pages);
 
         // A later rename is what gets saved next, not the name loaded at startup.
         second.run("file.setAuthor", json!({"name": "Grace Hopper"})).unwrap();
@@ -596,9 +658,61 @@ mod tests {
     fn prefs_without_user_name_keep_default() {
         let mut a = app();
         let default = a.session.author.clone();
-        a.apply_prefs(serde_json::from_str(r#"{"dark": true, "backstage": true}"#).unwrap());
+        a.apply_prefs(serde_json::from_str(r#"{"dark": true, "blackPages": true, "backstage": true}"#).unwrap());
         assert_eq!(a.session.author, default);
         assert!(a.ui.dark);
+        assert!(a.ui.black_pages);
         assert!(!a.ui.backstage);
+    }
+
+    #[test]
+    fn browser_download_does_not_mark_the_server_document_saved() {
+        let mut app = app();
+        app.session.dirty = true;
+        app.services.download = Some(Box::new(|_, _| Ok(())));
+
+        app.run("file.saveAs", json!({"path": "local-copy.json"})).unwrap();
+
+        assert!(app.session.dirty);
+    }
+
+    #[test]
+    fn browser_download_failure_is_reported_and_keeps_dirty_state() {
+        let mut app = app();
+        app.session.dirty = true;
+        app.services.download = Some(Box::new(|_, _| Err("browser blocked the download".into())));
+
+        let result = app.run("file.saveAs", json!({"path": "local-copy.json"}));
+
+        assert!(result.is_err());
+        assert!(app.session.dirty);
+        assert!(app.status_msg.as_ref().is_some_and(|(message, _)| message.contains("browser blocked")));
+    }
+
+    #[test]
+    fn export_download_uses_the_requested_format_without_clearing_dirty_state() {
+        let mut app = app();
+        app.session.doc = wordcraft_doc::Document::from_text("copy text");
+        app.session.dirty = true;
+        let downloaded = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let server_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let capture = downloaded.clone();
+        let server_called_capture = server_called.clone();
+        app.services.download = Some(Box::new(move |name, bytes| {
+            *capture.lock().unwrap() = Some((name.to_string(), bytes.to_vec()));
+            Ok(())
+        }));
+        app.services.server_save = Some(Box::new(move |_, _, _| {
+            server_called_capture.store(true, std::sync::atomic::Ordering::Relaxed);
+        }));
+
+        app.download_export("copy.txt").unwrap();
+
+        let downloaded = downloaded.lock().unwrap();
+        let (name, bytes) = downloaded.as_ref().unwrap();
+        assert_eq!(name, "copy.txt");
+        assert_eq!(bytes.as_slice(), b"copy text");
+        assert!(app.session.dirty);
+        assert!(!server_called.load(std::sync::atomic::Ordering::Relaxed));
     }
 }

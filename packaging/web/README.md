@@ -10,7 +10,40 @@ static site in `wordcraft-web-<version>/`:
 | `wordcraft-web-<hash>_bg.wasm` | The app, about 13 MB, or 5 MB with compression |
 | `_headers`, `.htaccess` | Sample header rules for Netlify/Cloudflare Pages and Apache |
 
-There is no server-side code. Upload the folder's contents anywhere that serves static files.
+The release zip contains only the static browser assets. It can still be hosted as a stand-alone
+editor, but it does not include persistence or collaboration. For server-backed shared documents,
+build and run the `wordcraft-server` companion described below.
+
+## Shared-document server
+
+`wordcraft-server` serves both these assets and the same-origin `/api` used by the web editor. It
+stores versioned WordCraft document snapshots, including embedded media and preserved source parts,
+in SQLite. The browser exposes separate actions for saving to the server, saving as a new server
+document, and downloading exported copies. A stale save is rejected with a version conflict, and
+local edits remain open so the user can reload the newer server version or save a separate copy.
+Unsaved edits are also written to browser `localStorage` after 500 ms without a new edit, for
+recovery after a reload. The recovery snapshot is limited to 2 MiB of serialized JSON to leave room under common per-origin
+storage quotas; oversized drafts or blocked/quota-full storage are reported in the app, and the
+browser warns before leaving when edits remain unsaved. Download a copy before leaving if the app
+reports that local recovery is unavailable.
+
+This is the persistent-document milestone; it does **not** yet provide WebSocket-based real-time
+co-editing. Two clients editing concurrently will be protected from silent overwrite, but they will
+not see one another's keystrokes until operation-based collaboration is implemented.
+
+```sh
+cargo build --release -p wordcraft-server --bin wordcraft-server
+(cd apps/wordcraft-web && trunk build --release)
+WORDCRAFT_BIND=127.0.0.1:8787 \
+WORDCRAFT_DATA_DIR=./data \
+WORDCRAFT_WEB_DIR=./dist/web \
+./target/release/wordcraft-server
+```
+
+Open `http://127.0.0.1:8787/`. For macOS LaunchDaemon, HTTPS reverse proxy, and service-account
+setup, see [the headless Mac deployment guide](../macos/wordcraft-server.md). The server defaults to
+loopback and has no built-in TLS or user login; keep it behind a trusted reverse proxy if other
+devices need access.
 
 ## Any path works
 
@@ -69,8 +102,8 @@ Local test: `python3 -m http.server 8765` inside the folder, then open http://lo
   then starts with defaults.
 - **Sandboxed iframes** need at least
   `sandbox="allow-scripts allow-same-origin allow-downloads allow-popups"`. Without
-  `allow-same-origin` there's no storage. Without `allow-downloads`, Save and Export (browser
-  downloads) are blocked.
+  `allow-same-origin` there's no local preference storage. Without `allow-downloads`, DOCX/PDF
+  exports are blocked. Server saves use the hosting origin's `/api` endpoint.
 - Don't send `X-Frame-Options: DENY` or a `frame-ancestors` CSP that excludes the embedding page.
 
 ## Renderer selection and fallback flags

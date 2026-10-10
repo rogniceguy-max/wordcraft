@@ -111,4 +111,21 @@ the icon art).
 - Comment balloons in a markup area beside each page, with leader lines to their anchors.
 
 ## Next
-The DOCX fidelity corpus, then footnote continuation, column balancing and native printing.
+The collaboration milestone for the WordCraft Web internal document system is tracked separately
+from desktop feature parity:
+
+| Web collaboration phase | State |
+|---|---|
+| P0 architecture audit | **done**; `docs/collaboration-model.md` records the positional-path and snapshot-undo hazards |
+| P1 browser build and DOCX round-trip | Trunk release build and local WebGPU/WebGL2 browser startup/input/server-save smoke passed; DOCX browser round-trip and Chrome/Edge/Safari/IME matrix remain unverified |
+| P2 server persistence, CAS versions and restore | implemented; workspace CI and local HTTP/browser save smoke passed, including stale-version conflict and restore; Mac restart recovery remains unverified |
+| P3 live collaborative text | **prototype only**; Yrs concurrent Unicode/undo tests pass but are not wired into the editor |
+| P4 rich-text/table collaboration and presence | not started; no WebSocket sync, shared cursor, or multi-client acceptance path yet |
+| P5 per-browser pure-black page display | implemented and covered by renderer/UI tests; in-browser black-theme visual review remains pending |
+| P6 dated backup and restore tooling | implemented; workspace CI and local backup verify/restore smoke passed against an isolated test database; launchd scheduling remains unverified on macOS |
+| P7 Mac mini deployment and browser acceptance | not run; no target Mac is connected, and scenarios A–I have not passed end to end |
+
+These results validate the web shell, persistence API, prototype, theme, and backup components. They do not meet the final two-client real-time collaboration success criterion until P4 and the Mac/browser acceptance work are completed.
+
+The DOCX fidelity corpus, then footnote continuation, column balancing and native printing remain
+the next desktop parity priorities.

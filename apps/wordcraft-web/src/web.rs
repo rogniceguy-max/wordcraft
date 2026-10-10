@@ -1,8 +1,11 @@
 //! The browser shell: web `Services`, drag-and-drop, and the eframe web runner.
 
 use wasm_bindgen::JsCast as _;
+use wasm_bindgen::closure::Closure;
 use wordcraft_engine::Session;
-use wordcraft_ui_egui::{Inbox, Services, WordApp};
+use wordcraft_ui_egui::{Inbox, Services, UiState, WordApp};
+
+use crate::server::ServerBridge;
 
 const DOC_EXTS: &[&str] = &["docx", "docm", "dotx", "odt", "rtf", "txt", "md", "html", "htm", "json"];
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
@@ -36,9 +39,15 @@ pub fn start() {
                     }
                     let inbox: Inbox = Inbox::default();
                     let doc = if query().contains("sample") { wordcraft_engine::sample::sample_document() } else { wordcraft_doc::Document::new() };
-                    let mut app = WordApp::new(Session::new(doc), services(inbox.clone(), cc.egui_ctx.clone()));
+                    let server = ServerBridge::new();
+                    let mut app = WordApp::new(Session::new(doc), services(inbox.clone(), cc.egui_ctx.clone(), server.clone()));
+                    if let Some(prefs) = load_preferences() {
+                        app.apply_prefs(prefs);
+                    }
                     app.autosave = false;
-                    Ok(Box::new(WebShell { app, inbox }))
+                    let prefs_json = serde_json::to_string(&app.prefs()).unwrap_or_default();
+                    let unload_warning = install_unsaved_warning(server.dirty_signal());
+                    Ok(Box::new(WebShell { app, inbox, server, prefs_json, _unload_warning: unload_warning }))
                 }),
             )
             .await;
@@ -60,6 +69,9 @@ fn query() -> String {
 struct WebShell {
     app: WordApp,
     inbox: Inbox,
+    server: ServerBridge,
+    prefs_json: String,
+    _unload_warning: Option<Closure<dyn FnMut(web_sys::BeforeUnloadEvent)>>,
 }
 
 impl eframe::App for WebShell {
@@ -80,6 +92,8 @@ impl eframe::App for WebShell {
             });
         }
         self.app.logic(ctx);
+        self.server.logic(&mut self.app, ctx);
+        self.persist_preferences();
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
@@ -87,11 +101,13 @@ impl eframe::App for WebShell {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.app.ui(ui);
+        if self.app.ui(ui) {
+            self.server.ui(&mut self.app, ui.ctx());
+        }
     }
 }
 
-fn services(inbox: Inbox, ctx: egui::Context) -> Services {
+fn services(inbox: Inbox, ctx: egui::Context, server: ServerBridge) -> Services {
     let open_inbox = inbox.clone();
     Services {
         open_async: Some(Box::new(move |purpose: &str| {
@@ -113,14 +129,48 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
         })),
         // Exports ask for a name; the browser decides where the download goes.
         pick_save: Some(Box::new(|name: &str| Some(name.to_string()))),
-        download: Some(Box::new(|name: &str, bytes: &[u8]| {
-            if let Err(e) = download(name, bytes) {
-                log::error!("download of {name} failed: {e}");
-            }
-        })),
+        download: Some(Box::new(download)),
+        server_save: Some(server.save_handler()),
         inbox: Some(inbox),
         ..Default::default()
     }
+}
+
+fn load_preferences() -> Option<UiState> {
+    let storage = web_sys::window()?.local_storage().ok()??;
+    let saved = storage.get_item("wordcraft-ui-preferences").ok()??;
+    serde_json::from_str(&saved).ok()
+}
+
+impl WebShell {
+    fn persist_preferences(&mut self) {
+        let Ok(encoded) = serde_json::to_string(&self.app.prefs()) else { return };
+        if encoded == self.prefs_json {
+            return;
+        }
+        let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten()) else { return };
+        match storage.set_item("wordcraft-ui-preferences", &encoded) {
+            Ok(()) => self.prefs_json = encoded,
+            Err(error) => log::warn!("could not store browser preferences: {error:?}"),
+        }
+    }
+}
+
+fn install_unsaved_warning(dirty: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Option<Closure<dyn FnMut(web_sys::BeforeUnloadEvent)>> {
+    use std::sync::atomic::Ordering;
+
+    let window = web_sys::window()?;
+    let callback = Closure::wrap(Box::new(move |event: web_sys::BeforeUnloadEvent| {
+        if dirty.load(Ordering::Relaxed) {
+            event.prevent_default();
+            event.set_return_value("There are local edits that have not been confirmed by the server.");
+        }
+    }) as Box<dyn FnMut(_)>);
+    if let Err(error) = window.add_event_listener_with_callback("beforeunload", callback.as_ref().unchecked_ref()) {
+        log::warn!("could not install unsaved-change warning: {error:?}");
+        return None;
+    }
+    Some(callback)
 }
 
 /// Trigger a browser download of `bytes` named after the last component of `path`.
