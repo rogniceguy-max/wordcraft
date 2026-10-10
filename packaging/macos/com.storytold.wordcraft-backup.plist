@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.storytold.wordcraft-backup</string>
+
+    <key>UserName</key>
+    <string>CHANGE_ME_TO_WORDCRAFT_SERVICE_ACCOUNT</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/wordcraft-backup</string>
+        <string>daily</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>WORDCRAFT_DATA_DIR</key>
+        <string>/Users/CHANGE_ME/Library/Application Support/WordCraft/data</string>
+        <key>WORDCRAFT_BACKUP_DIR</key>
+        <string>/Users/CHANGE_ME/Library/Application Support/WordCraft/backups</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/CHANGE_ME/Library/Logs/WordCraftBackup.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/CHANGE_ME/Library/Logs/WordCraftBackup.stderr.log</string>
+</dict>
+</plist>

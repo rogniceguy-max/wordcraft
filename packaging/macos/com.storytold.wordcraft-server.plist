@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.storytold.wordcraft-server</string>
+
+    <key>UserName</key>
+    <string>CHANGE_ME_TO_WORDCRAFT_SERVICE_ACCOUNT</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/wordcraft-server</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/CHANGE_ME/Library/Application Support/WordCraft</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>WORDCRAFT_BIND</key>
+        <string>127.0.0.1:8787</string>
+        <key>WORDCRAFT_DATA_DIR</key>
+        <string>/Users/CHANGE_ME/Library/Application Support/WordCraft/data</string>
+        <key>WORDCRAFT_WEB_DIR</key>
+        <string>/Users/CHANGE_ME/Library/Application Support/WordCraft/web</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/CHANGE_ME/Library/Logs/WordCraftServer.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/CHANGE_ME/Library/Logs/WordCraftServer.stderr.log</string>
+</dict>
+</plist>
