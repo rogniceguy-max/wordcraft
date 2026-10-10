@@ -103,7 +103,7 @@ impl eframe::App for WebShell {
         self.server.logic(&mut self.app, ctx, collaboration_active, snapshot_locked);
         let document_id = self.server.active_document_id();
         self.collaboration.logic(&mut self.app.session, document_id.as_deref(), ctx);
-        self.app.canvas.remote_selections = self.collaboration.remote_selections();
+        self.app.canvas.remote_selections = self.collaboration.remote_selections(&self.app.session);
         self.server.sync_dirty_signal(&self.app);
         self.persist_preferences();
     }

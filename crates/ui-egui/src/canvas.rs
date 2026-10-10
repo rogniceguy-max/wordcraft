@@ -430,7 +430,7 @@ fn remote_carets_and_labels(app: &WordApp, ui: &Ui, painter: &egui::Painter, rec
 }
 
 fn valid_remote_body_position(app: &WordApp, pos: &Pos) -> bool {
-    if pos.story != StoryRef::Body || pos.path.0.len() != 1 {
+    if pos.story != StoryRef::Body || pos.path.depth() > 1 {
         return false;
     }
     app.session.doc.para_at(pos).is_some_and(|paragraph| pos.off <= paragraph.text.len() && paragraph.text.is_char_boundary(pos.off))

@@ -19,15 +19,21 @@ server exposes `/api/documents/{id}/collab` as a binary Yrs WebSocket. It reuses
 WordCraft `Session`, command dispatch, document model, and renderer; it does not replace the editor
 with a textarea.
 
-The current adapter accepts 1–256 fixed top-level body paragraphs with plain text and direct bold,
-italic, and single underline formatting on selected text. Paragraph order and count remain fixed
-for the collaboration epoch. Paragraph 0 retains the legacy `body:main` Yrs root; later paragraphs
-use `body:paragraph:{index}`, with the count recovered from the materialized snapshot. This keeps
-existing single-paragraph P3 epochs readable. Editing and formatting must stay within one
-paragraph; paragraph insertion, deletion, merging, and other structure changes are rejected or
-reverted. It also rejects tables, paragraph formatting, pending formatting at the paragraph mark,
-other character styles, inline objects, section breaks, comments, revisions, sources, track changes,
-document protection, and unsupported control characters. The combined text limit is 8 MiB.
+The current adapter accepts 1–256 fixed body paragraphs with plain text and direct bold, italic, and
+single underline formatting on selected text. The body may contain top-level paragraphs and
+one-level tables with unmerged cells; each cell may contain multiple paragraphs. Paragraph order,
+count, and table-cell paragraph topology remain fixed for the collaboration epoch. Top-level
+paragraphs retain their legacy roots (`body:main` for the first shared paragraph and
+`body:paragraph:{index}` for later top-level paragraphs); table-cell paragraphs use
+`body:cell-paragraph:{path}`, where the path is the full WordCraft path such as `1/0/1/0`. The
+server derives this ordered root manifest from the materialized snapshot, and both ends use it to
+map edits, formatting, and selections. This keeps existing paragraph-only P3 epochs readable.
+Editing and formatting must stay within one paragraph; paragraph insertion, deletion, merging,
+table-cell topology changes, and other structure changes are rejected or reverted. Nested tables,
+merged cells, more than 256 roots/cells, tables wider than 63 columns, and combined text over 8 MiB
+are rejected. The adapter also rejects paragraph formatting, pending formatting at the paragraph
+mark, other character styles, inline objects, section breaks, comments, revisions, sources, track
+changes, document protection, and unsupported control characters.
 
 Formatting can be seeded from an eligible saved document and is persisted with live updates.
 WordCraft positions are UTF-8 byte offsets. The browser adapter uses Yrs UTF-16 indexing for stable
@@ -80,25 +86,33 @@ scale, remain outside page textures and local selection state, and show the temp
 label in a deterministic color. Tests cover Unicode rebasing, wrong-root rejection, parser bounds,
 cursor fanout, throttle/coalescing, reconnect resend, and storage isolation.
 
-P4.5 still does not support table-cell editing, paragraph structure editing, or automatic reload
-rejoin. Browser-level three-tab localhost smoke has passed for edits in both directions and
-actor-scoped undo. A separate two-tab smoke confirmed that selected bold, italic, and single
-underline reached both editors and the materialized server snapshot; typing inside the styled run
-preserved those attributes in the server snapshot. Presence and cursor overlays have not yet had
-browser smoke. Automatic reconnect backoff and stale-socket filtering have unit coverage, while
-browser outage and recovery remain unverified. Multi-paragraph collaboration also lacks browser
-smoke. Reopening the document after a page reload showed the durable snapshot-save/restore fence.
-The prior browser checks ran on one Windows host; they do not verify separate computers, IME
-behavior, DOCX round-trip, Mac mini startup/reboot, or the target performance matrix.
+P4.6 adds fixed-topology table-cell text editing, including multiple paragraphs per cell. Server
+tests cover manifest naming, table metadata preservation during materialization, durable replay,
+and rejection of changed structure; client tests cover cell edit and format convergence,
+path-preserving selection and cursor mapping across Unicode rebases, and table-structure rollback
+through the editor command wrapper. Workspace CI passed all six stages, and the Trunk release WASM
+build succeeded on Windows.
+Table-cell, presence, and cursor overlays still need browser smoke. Paragraph structure and table
+topology edits, nested/merged table cells, and automatic reload rejoin remain unsupported.
+Browser-level three-tab localhost smoke has passed for edits in both directions and actor-scoped
+undo. A separate two-tab smoke confirmed that selected bold, italic, and single underline reached
+both editors and the materialized server snapshot; typing inside the styled run preserved those
+attributes in the server snapshot. Automatic reconnect backoff and stale-socket filtering have
+unit coverage, while browser outage and recovery remain unverified. Multi-paragraph collaboration
+also lacks browser smoke. Reopening the document after a page reload showed the durable
+snapshot-save/restore fence. The prior browser checks ran on one Windows host; they do not verify
+separate computers, IME behavior, DOCX round-trip, Mac mini startup/reboot, or the target performance
+matrix.
 
 ## Integration gate
 
-The next gate is fixed-topology table-cell text roots. Broader character and paragraph formatting
-and safe range operations follow only after those mappings are tested. The collaboration path also
-needs a safe way to reconcile pending updates after reload, update-log compaction, and a history
-model that can snapshot/restore an epoch without letting stale sessions overwrite it. Automated
-multi-client acceptance should cover same-position insertions, delete/insert races, formatting,
-table cells, IME composition, and server restart before broadening the enabled command set.
+The next gate is browser smoke for fixed-topology table-cell edits plus presence and cursor
+overlays. Broader character and paragraph formatting and safe range operations follow only after
+those mappings are tested. The collaboration path also needs a safe way to reconcile pending
+updates after reload, update-log compaction, and a history model that can snapshot/restore an epoch
+without letting stale sessions overwrite it. Automated multi-client acceptance should cover
+same-position insertions, delete/insert races, formatting, table cells, IME composition, and server
+restart before broadening the enabled command set.
 
 Yrs updates are idempotent and commutative, so transport delivery order need not define the document
 order. Native whole-document undo is reset while live text is active; actor-scoped Yrs undo handles
