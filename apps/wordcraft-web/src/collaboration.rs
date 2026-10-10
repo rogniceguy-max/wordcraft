@@ -44,6 +44,74 @@ const MAX_SHARED_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const ATTR_BOLD: &str = "wc.bold";
 const ATTR_ITALIC: &str = "wc.italic";
 const ATTR_UNDERLINE: &str = "wc.underline";
+const RECONNECT_INITIAL_DELAY_MS: u64 = 500;
+const RECONNECT_MAX_DELAY_MS: u64 = 30_000;
+#[cfg(target_arch = "wasm32")]
+const CONNECT_TIMEOUT_MS: u64 = 15_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconnectDecision {
+    Disabled,
+    Wait(u64),
+    RetryNow,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReconnectSchedule {
+    enabled: bool,
+    attempts: u32,
+    retry_at_ms: Option<u64>,
+}
+
+impl ReconnectSchedule {
+    fn start(&mut self) {
+        self.enabled = true;
+        self.attempts = 0;
+        self.retry_at_ms = None;
+    }
+
+    fn pause(&mut self) {
+        self.enabled = false;
+        self.retry_at_ms = None;
+    }
+
+    fn connected(&mut self) {
+        self.attempts = 0;
+        self.retry_at_ms = None;
+    }
+
+    fn tick(&mut self, now_ms: u64) -> ReconnectDecision {
+        if !self.enabled {
+            return ReconnectDecision::Disabled;
+        }
+        let retry_at_ms = match self.retry_at_ms {
+            Some(retry_at_ms) => retry_at_ms,
+            None => {
+                let delay_ms = Self::delay_ms(self.attempts);
+                self.attempts = self.attempts.saturating_add(1);
+                let retry_at_ms = now_ms.saturating_add(delay_ms);
+                self.retry_at_ms = Some(retry_at_ms);
+                retry_at_ms
+            }
+        };
+        if now_ms >= retry_at_ms {
+            self.retry_at_ms = None;
+            ReconnectDecision::RetryNow
+        } else {
+            ReconnectDecision::Wait(retry_at_ms - now_ms)
+        }
+    }
+
+    fn delay_ms(attempt: u32) -> u64 {
+        let multiplier = 1_u64 << attempt.min(6);
+        RECONNECT_INITIAL_DELAY_MS.saturating_mul(multiplier).min(RECONNECT_MAX_DELAY_MS)
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn is_current_socket_generation(event_generation: u64, current_generation: u64) -> bool {
+    event_generation == current_generation
+}
 
 /// True only for a document with one plain-text paragraph and supported direct character styles.
 pub fn supported_body_text(document: &Document) -> Option<String> {
@@ -617,6 +685,9 @@ struct BridgeState {
     document_id: Option<String>,
     adapter: Option<LiveText>,
     socket: Option<web_sys::WebSocket>,
+    socket_generation: u64,
+    connection_deadline_ms: Option<u64>,
+    reconnect: ReconnectSchedule,
     on_open: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>>,
     on_message: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::MessageEvent)>>,
     on_close: Option<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>>,
@@ -640,11 +711,24 @@ enum ConnectionPhase {
 
 #[cfg(target_arch = "wasm32")]
 enum SocketEvent {
-    Open,
-    Message(Vec<u8>),
-    BadMessage(String),
-    Closed,
-    Error,
+    Open { generation: u64 },
+    Message { generation: u64, bytes: Vec<u8> },
+    BadMessage { generation: u64, message: String },
+    Closed { generation: u64 },
+    Error { generation: u64 },
+}
+
+#[cfg(target_arch = "wasm32")]
+impl SocketEvent {
+    fn generation(&self) -> u64 {
+        match self {
+            SocketEvent::Open { generation }
+            | SocketEvent::Message { generation, .. }
+            | SocketEvent::BadMessage { generation, .. }
+            | SocketEvent::Closed { generation }
+            | SocketEvent::Error { generation } => *generation,
+        }
+    }
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -661,6 +745,9 @@ impl Default for BridgeState {
             document_id: None,
             adapter: None,
             socket: None,
+            socket_generation: 0,
+            connection_deadline_ms: None,
+            reconnect: ReconnectSchedule::default(),
             on_open: None,
             on_message: None,
             on_close: None,
@@ -722,6 +809,8 @@ impl CollaborationBridge {
             let Ok(mut state) = self.inner.try_borrow_mut() else { return };
             if state.document_id.is_some() && state.document_id.as_deref() != active_document_id {
                 state.close_socket();
+                state.reconnect.pause();
+                state.connection_deadline_ms = None;
                 state.phase = ConnectionPhase::Inactive;
                 state.document_id = None;
                 state.adapter = None;
@@ -741,43 +830,90 @@ impl CollaborationBridge {
 
         for event in events {
             let Ok(mut state) = self.inner.try_borrow_mut() else { return };
+            if !is_current_socket_generation(event.generation(), state.socket_generation) {
+                continue;
+            }
             match event {
-                SocketEvent::Open => {
+                SocketEvent::Open { .. } => {
                     if state.phase == ConnectionPhase::Connecting {
                         state.status = "Connected. Waiting for the server's live text state…".into();
                     }
                 }
-                SocketEvent::Message(bytes) => {
+                SocketEvent::Message { bytes, .. } => {
                     if let Err(error) = state.apply_message(session, &bytes) {
                         state.phase = ConnectionPhase::Faulted;
+                        state.connection_deadline_ms = None;
+                        state.reconnect.pause();
                         state.status = error;
                         state.close_socket();
                     }
                 }
-                SocketEvent::BadMessage(message) => {
+                SocketEvent::BadMessage { message, .. } => {
                     state.phase = ConnectionPhase::Faulted;
+                    state.connection_deadline_ms = None;
+                    state.reconnect.pause();
                     state.status = message;
                     state.close_socket();
                 }
-                SocketEvent::Closed => {
+                SocketEvent::Closed { .. } => {
                     if state.phase != ConnectionPhase::Inactive && state.phase != ConnectionPhase::Faulted {
+                        state.connection_deadline_ms = None;
+                        state.close_socket();
                         state.phase = ConnectionPhase::Offline;
-                        state.status = "Live text connection closed. Reconnect to continue editing; local updates remain in this browser.".into();
+                        state.status = "Live text connection closed. Automatic reconnect is active; editing stays paused until the server confirms the current state.".into();
                     }
                 }
-                SocketEvent::Error => {
+                SocketEvent::Error { .. } => {
                     if state.phase != ConnectionPhase::Inactive && state.phase != ConnectionPhase::Faulted {
+                        state.connection_deadline_ms = None;
+                        state.close_socket();
                         state.phase = ConnectionPhase::Offline;
-                        state.status = "Live text connection failed. Reconnect to continue editing; local updates remain in this browser.".into();
+                        state.status = "Live text connection failed. Automatic reconnect is active; editing stays paused until the server confirms the current state.".into();
                     }
                 }
             }
             ctx.request_repaint();
         }
+        self.maybe_auto_reconnect(active_document_id, ctx);
+    }
+
+    fn maybe_auto_reconnect(&self, active_document_id: Option<&str>, ctx: &egui::Context) {
+        let now_ms = monotonic_now_ms();
+        let (retry_document, wait_ms) = {
+            let Ok(mut state) = self.inner.try_borrow_mut() else { return };
+            if state.phase == ConnectionPhase::Connecting && state.connection_deadline_ms.is_some_and(|deadline| now_ms >= deadline) {
+                state.close_socket();
+                state.connection_deadline_ms = None;
+                state.phase = ConnectionPhase::Offline;
+                state.status = "The live server did not respond in time. Automatic reconnect is active; editing stays paused.".into();
+            }
+            if state.phase != ConnectionPhase::Offline || state.document_id.as_deref() != active_document_id {
+                (None, None)
+            } else {
+                match state.reconnect.tick(now_ms) {
+                    ReconnectDecision::Disabled => (None, None),
+                    ReconnectDecision::Wait(wait_ms) => (None, Some(wait_ms)),
+                    ReconnectDecision::RetryNow => {
+                        let document_id = state.document_id.clone();
+                        if document_id.is_some() {
+                            state.phase = ConnectionPhase::Connecting;
+                            state.connection_deadline_ms = Some(now_ms.saturating_add(CONNECT_TIMEOUT_MS));
+                            state.status = "Reconnecting to live text… editing stays paused until the server confirms the current state.".into();
+                        }
+                        (document_id, None)
+                    }
+                }
+            }
+        };
+        if let Some(document_id) = retry_document {
+            self.open_socket(&document_id, ctx);
+        } else if let Some(wait_ms) = wait_ms {
+            ctx.request_repaint_after(std::time::Duration::from_millis(wait_ms.max(1)));
+        }
     }
 
     pub fn ui(&self, session: &mut Session, active_document_id: Option<String>, join_readiness: Result<(), String>, ctx: &egui::Context) {
-        let (phase, status, current_id, snapshot_locked) = self
+        let (phase, status, current_id, snapshot_locked, auto_reconnect) = self
             .inner
             .try_borrow()
             .map(|state| {
@@ -786,9 +922,10 @@ impl CollaborationBridge {
                     state.status.clone(),
                     state.document_id.clone(),
                     active_document_id.as_deref().is_some_and(|id| state.epoch_documents.contains(id)),
+                    state.reconnect.enabled,
                 )
             })
-            .unwrap_or((ConnectionPhase::Faulted, "Live text state is busy.".into(), None, false));
+            .unwrap_or((ConnectionPhase::Faulted, "Live text state is busy.".into(), None, false, false));
 
         let mut join = false;
         let mut reconnect = false;
@@ -820,6 +957,9 @@ impl CollaborationBridge {
                     }
                     ConnectionPhase::Connecting => {
                         ui.add_enabled(false, egui::Button::new("Connecting…"));
+                        if auto_reconnect && ui.button("Pause retries").clicked() {
+                            disconnect = true;
+                        }
                     }
                     ConnectionPhase::Live => {
                         ui.colored_label(egui::Color32::LIGHT_GREEN, "Live text and formatting updates are being persisted by the server.");
@@ -827,13 +967,19 @@ impl CollaborationBridge {
                             disconnect = true;
                         }
                     }
-                    ConnectionPhase::Offline | ConnectionPhase::Faulted => {
+                    ConnectionPhase::Offline => {
+                        if ui.button("Reconnect now").clicked() {
+                            reconnect = true;
+                        }
+                        if auto_reconnect && ui.button("Pause retries").clicked() {
+                            disconnect = true;
+                        }
+                    }
+                    ConnectionPhase::Faulted => {
                         if ui.button("Reconnect").clicked() {
                             reconnect = true;
                         }
-                        if phase == ConnectionPhase::Faulted {
-                            ui.colored_label(egui::Color32::YELLOW, "This editor is read-only after an unsupported live update. Open another document or Save As a separate copy.");
-                        }
+                        ui.colored_label(egui::Color32::YELLOW, "This editor is read-only after an unsupported live update. Open another document or Save As a separate copy.");
                     }
                 }
             });
@@ -874,9 +1020,11 @@ impl CollaborationBridge {
                 state.adapter = Some(LiveText::new());
                 state.first_state_received = false;
             }
+            state.reconnect.start();
+            state.connection_deadline_ms = None;
             state.document_id = Some(document_id.clone());
             state.phase = ConnectionPhase::Connecting;
-            state.status = "Connecting to live text…".into();
+            state.status = "Connecting to live text… automatic reconnect is enabled if the connection drops.".into();
         } else {
             return;
         }
@@ -890,6 +1038,8 @@ impl CollaborationBridge {
                 return;
             }
             state.close_socket();
+            state.reconnect.start();
+            state.connection_deadline_ms = None;
             state.first_state_received = false;
             state.phase = ConnectionPhase::Connecting;
             state.status = "Reconnecting to live text…".into();
@@ -901,6 +1051,14 @@ impl CollaborationBridge {
 
     fn open_socket(&self, document_id: &str, ctx: &egui::Context) {
         use wasm_bindgen::JsCast as _;
+
+        let generation = {
+            let Ok(mut state) = self.inner.try_borrow_mut() else { return };
+            state.close_socket();
+            state.connection_deadline_ms = Some(monotonic_now_ms().saturating_add(CONNECT_TIMEOUT_MS));
+            state.socket_generation
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(CONNECT_TIMEOUT_MS));
 
         let Some(window) = web_sys::window() else {
             self.set_error("Browser window is unavailable.");
@@ -941,7 +1099,7 @@ impl CollaborationBridge {
         let weak = std::rc::Rc::downgrade(&self.inner);
         let repaint = ctx.clone();
         let on_open = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-            enqueue_socket_event(&weak, SocketEvent::Open, &repaint);
+            enqueue_socket_event(&weak, SocketEvent::Open { generation }, &repaint);
         });
         let weak = std::rc::Rc::downgrade(&self.inner);
         let repaint = ctx.clone();
@@ -949,10 +1107,12 @@ impl CollaborationBridge {
             use wasm_bindgen::JsCast as _;
             let data = event.data();
             match data.dyn_into::<js_sys::ArrayBuffer>() {
-                Ok(buffer) => enqueue_socket_event(&weak, SocketEvent::Message(js_sys::Uint8Array::new(&buffer).to_vec()), &repaint),
+                Ok(buffer) => {
+                    enqueue_socket_event(&weak, SocketEvent::Message { generation, bytes: js_sys::Uint8Array::new(&buffer).to_vec() }, &repaint)
+                }
                 Err(_) => enqueue_socket_event(
                     &weak,
-                    SocketEvent::BadMessage("The live server sent a non-binary message; the editor was paused.".into()),
+                    SocketEvent::BadMessage { generation, message: "The live server sent a non-binary message; the editor was paused.".into() },
                     &repaint,
                 ),
             }
@@ -960,12 +1120,12 @@ impl CollaborationBridge {
         let weak = std::rc::Rc::downgrade(&self.inner);
         let repaint = ctx.clone();
         let on_close = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-            enqueue_socket_event(&weak, SocketEvent::Closed, &repaint);
+            enqueue_socket_event(&weak, SocketEvent::Closed { generation }, &repaint);
         });
         let weak = std::rc::Rc::downgrade(&self.inner);
         let repaint = ctx.clone();
         let on_error = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-            enqueue_socket_event(&weak, SocketEvent::Error, &repaint);
+            enqueue_socket_event(&weak, SocketEvent::Error { generation }, &repaint);
         });
         socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
         socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
@@ -973,18 +1133,24 @@ impl CollaborationBridge {
         socket.set_onerror(Some(on_error.as_ref().unchecked_ref()));
 
         if let Ok(mut state) = self.inner.try_borrow_mut() {
-            state.close_socket();
-            state.socket = Some(socket);
-            state.on_open = Some(on_open);
-            state.on_message = Some(on_message);
-            state.on_close = Some(on_close);
-            state.on_error = Some(on_error);
+            if state.socket_generation == generation {
+                state.socket = Some(socket);
+                state.on_open = Some(on_open);
+                state.on_message = Some(on_message);
+                state.on_close = Some(on_close);
+                state.on_error = Some(on_error);
+            } else {
+                let _ = socket.close();
+            }
+        } else {
+            let _ = socket.close();
         }
     }
 
     fn set_error(&self, error: impl Into<String>) {
         if let Ok(mut state) = self.inner.try_borrow_mut() {
             state.phase = ConnectionPhase::Offline;
+            state.connection_deadline_ms = None;
             state.status = error.into();
         }
     }
@@ -992,6 +1158,8 @@ impl CollaborationBridge {
     fn disconnect(&self, session: &mut Session) {
         if let Ok(mut state) = self.inner.try_borrow_mut() {
             state.close_socket();
+            state.reconnect.pause();
+            state.connection_deadline_ms = None;
             state.phase = ConnectionPhase::Offline;
             state.first_state_received = false;
             state.status = "Connection paused. Reconnect before editing; live updates are durable, but version history excludes them and restore is unavailable.".into();
@@ -1242,6 +1410,8 @@ impl BridgeState {
             let result = adapter.apply_full_state(session, bytes)?;
             self.first_state_received = true;
             self.phase = ConnectionPhase::Live;
+            self.connection_deadline_ms = None;
+            self.reconnect.connected();
             self.status =
                 "Live. Text changes are persisted by the server; version history excludes these edits. No cursor presence is shared.".into();
             if let Some(id) = self.document_id.clone() {
@@ -1317,6 +1487,7 @@ impl BridgeState {
     }
 
     fn close_socket(&mut self) {
+        self.socket_generation = self.socket_generation.wrapping_add(1);
         if let Some(socket) = self.socket.take() {
             socket.set_onopen(None);
             socket.set_onmessage(None);
@@ -1342,6 +1513,12 @@ fn enqueue_socket_event(state: &std::rc::Weak<std::cell::RefCell<BridgeState>>, 
 }
 
 #[cfg(target_arch = "wasm32")]
+fn monotonic_now_ms() -> u64 {
+    web_sys::window().and_then(|window| window.performance()).map(|performance| performance.now()).unwrap_or_else(|| js_sys::Date::now()).max(0.0)
+        as u64
+}
+
+#[cfg(target_arch = "wasm32")]
 fn browser_error(error: wasm_bindgen::JsValue) -> String {
     error.as_string().unwrap_or_else(|| format!("{error:?}"))
 }
@@ -1349,14 +1526,39 @@ fn browser_error(error: wasm_bindgen::JsValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTR_BOLD, Any, Attrs, LiveText, MAX_SHARED_TEXT_BYTES, one_splice, resolve_sticky, selection_format_value, supported_body_text,
-        validate_shared_text,
+        ATTR_BOLD, Any, Attrs, LiveText, MAX_SHARED_TEXT_BYTES, ReconnectDecision, ReconnectSchedule, is_current_socket_generation, one_splice,
+        resolve_sticky, selection_format_value, supported_body_text, validate_shared_text,
     };
     use serde_json::json;
     use wordcraft_doc::{Block, CharProps, Document};
     use wordcraft_engine::{Selection, Session};
     use yrs::updates::decoder::Decode;
     use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
+
+    #[test]
+    fn automatic_reconnect_uses_exponential_backoff_and_resets_after_sync() {
+        let mut schedule = ReconnectSchedule::default();
+        assert_eq!(schedule.tick(100), ReconnectDecision::Disabled);
+
+        schedule.start();
+        assert_eq!(schedule.tick(100), ReconnectDecision::Wait(500));
+        assert_eq!(schedule.tick(599), ReconnectDecision::Wait(1));
+        assert_eq!(schedule.tick(600), ReconnectDecision::RetryNow);
+        assert_eq!(schedule.tick(600), ReconnectDecision::Wait(1_000));
+        assert_eq!(schedule.tick(1_600), ReconnectDecision::RetryNow);
+        assert_eq!(ReconnectSchedule::delay_ms(100), 30_000);
+
+        schedule.connected();
+        assert_eq!(schedule.tick(5_000), ReconnectDecision::Wait(500));
+        schedule.pause();
+        assert_eq!(schedule.tick(5_500), ReconnectDecision::Disabled);
+    }
+
+    #[test]
+    fn events_from_a_closed_socket_generation_are_ignored() {
+        assert!(is_current_socket_generation(8, 8));
+        assert!(!is_current_socket_generation(7, 8));
+    }
 
     #[test]
     fn document_switch_discards_queued_events_and_unconfirmed_updates() {

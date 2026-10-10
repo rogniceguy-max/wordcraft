@@ -34,25 +34,30 @@ to the pinned Yrs 0.28.0 version. Replayed exact updates receive an
 acknowledgment only on the reconnecting socket. Server restarts rebuild the live state from the
 seed and update log.
 
-This is a P3/P4.1 narrow prototype, not the full collaboration product. Manual reconnect works within
-the same tab and retries unacknowledged update bytes. If a browser reload recovers an unacknowledged
-live edit, it keeps an immediate local snapshot and asks the user to make a separate server copy or
-discard it; it does not automatically rejoin that snapshot to the CRDT. Updates that are confirmed
-by the server are available from the current document after reopening. The per-document update log
-has no compaction, and live edits do not create immutable version-history rows. Snapshot save and
-restore are blocked after a live-text epoch is seeded. The durable epoch flag is returned as
+This is a P3/P4.2 narrow prototype, not the full collaboration product. Same-tab reconnect runs
+automatically while the same document remains selected, with exponential delay from 500 ms capped
+at 30 seconds and a 15-second connection timeout. Users can pause retries. Editing stays disabled
+until the server's current state is received; then the client retries exact unacknowledged update
+bytes and waits for durable acknowledgments. Socket generation tags discard events arriving late
+from an older connection. If a browser reload recovers an unacknowledged live edit, it keeps an
+immediate local snapshot and asks the user to make a separate server copy or discard it; it does not
+automatically rejoin that snapshot to the CRDT. Updates that are confirmed by the server are
+available from the current document after reopening. The per-document update log has no compaction,
+and live edits do not create immutable version-history rows. Snapshot save and restore are blocked
+after a live-text epoch is seeded. The durable epoch flag is returned as
 `snapshotLocked` on document-list and document-detail responses, so the browser keeps the save and
 restore warning visible after opening the document again or reloading the page. Local recovery
 drafts use a per-page key; a new page context rotates a copied session-storage ID before writing,
 while a same-tab reload reuses its key. The server takes an OS advisory lock so only one WordCraft
 API router can serve a given canonical database path at a time.
 
-This P4.1 slice does not provide shared presence, cursor broadcast, heartbeat timer, automatic
-reconnect, table-cell editing, structural editing, or multi-paragraph collaboration. Browser-level
-three-tab localhost smoke has passed for edits in both directions and actor-scoped undo. A separate
-two-tab smoke confirmed that selected bold, italic, and single underline reached both editors and
-the materialized server snapshot; typing inside the styled run preserved those attributes in the
-server snapshot. Reopening the document after a page reload also showed the durable
+This P4.2 slice does not provide shared presence, cursor broadcast, heartbeat timer, table-cell
+editing, structural editing, or multi-paragraph collaboration. Browser-level three-tab localhost
+smoke has passed for edits in both directions and actor-scoped undo. A separate two-tab smoke
+confirmed that selected bold, italic, and single underline reached both editors and the materialized
+server snapshot; typing inside the styled run preserved those attributes in the server snapshot.
+Automatic reconnect backoff and stale-socket filtering have unit coverage, while browser outage and
+recovery remain unverified. Reopening the document after a page reload also showed the durable
 snapshot-save/restore fence. These browser checks ran on one Windows host; they do not verify
 separate computers, IME behavior, DOCX round-trip, Mac mini startup/reboot, or the target performance
 matrix.
@@ -61,7 +66,7 @@ matrix.
 
 The next gate is to expand the adapter to stable paragraph and table-cell identities, broaden
 character and paragraph formatting, support range operations safely, and add presence, cursor and
-selection transport. It also needs automatic reconnect and a safe path to reconcile pending updates
+selection transport. It also needs a safe path to reconcile pending updates
 after reload, update-log compaction, and a history model that can snapshot/restore a collaborative
 epoch without letting stale sessions overwrite it. Automated multi-client acceptance should cover
 same-position insertions, delete/insert races, formatting, table cells, IME composition, and server
