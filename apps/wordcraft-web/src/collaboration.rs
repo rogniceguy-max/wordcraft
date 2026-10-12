@@ -2892,6 +2892,13 @@ mod tests {
         LiveText::with_paragraph_count(paragraph_count).expect("fixed-paragraph adapter initializes")
     }
 
+    fn seeded_client(document: &Document, initial: &[u8]) -> (Session, LiveText) {
+        let mut session = Session::new(document.clone());
+        let mut adapter = LiveText::with_document(document).expect("fixed body manifest initializes");
+        adapter.apply_full_state(&mut session, initial).expect("server state applies");
+        (session, adapter)
+    }
+
     #[test]
     fn accepts_fixed_plain_text_body_paragraphs_with_supported_character_styles() {
         assert_eq!(supported_body_text(&Document::from_text("hello")), Some(vec!["hello".into()]));
@@ -2971,12 +2978,8 @@ mod tests {
     fn editing_and_convergence_work_inside_a_fixed_table_cell() {
         let document = table_body_document();
         let initial = seed_document_roots(&document);
-        let mut alice_session = Session::new(document.clone());
-        let mut bob_session = Session::new(document.clone());
-        let mut alice = LiveText::with_document(&document).expect("Alice gets the fixed path manifest");
-        let mut bob = LiveText::with_document(&document).expect("Bob gets the fixed path manifest");
-        alice.apply_full_state(&mut alice_session, &initial).expect("Alice receives table-cell roots");
-        bob.apply_full_state(&mut bob_session, &initial).expect("Bob receives table-cell roots");
+        let (mut alice_session, mut alice) = seeded_client(&document, &initial);
+        let (mut bob_session, mut bob) = seeded_client(&document, &initial);
 
         let cell_path = Path(vec![1, 0, 0, 0]);
         alice_session.sel = Selection::caret(Pos::new(wordcraft_doc::StoryRef::Body, cell_path, "left".len()));
@@ -2997,12 +3000,8 @@ mod tests {
     fn selected_cell_format_converges_between_clients() {
         let document = table_body_document();
         let initial = seed_document_roots(&document);
-        let mut alice_session = Session::new(document.clone());
-        let mut bob_session = Session::new(document.clone());
-        let mut alice = LiveText::with_document(&document).expect("Alice gets the fixed path manifest");
-        let mut bob = LiveText::with_document(&document).expect("Bob gets the fixed path manifest");
-        alice.apply_full_state(&mut alice_session, &initial).expect("Alice receives table-cell roots");
-        bob.apply_full_state(&mut bob_session, &initial).expect("Bob receives table-cell roots");
+        let (mut alice_session, mut alice) = seeded_client(&document, &initial);
+        let (mut bob_session, mut bob) = seeded_client(&document, &initial);
 
         let cell_path = Path(vec![1, 0, 0, 0]);
         let cell_text = "left";
@@ -3038,9 +3037,7 @@ mod tests {
             paragraph.insert_text(0, "a😀bc", &CharProps::default()).expect("Unicode cell text inserts");
         }
         let initial = seed_document_roots(&document);
-        let mut session = Session::new(document.clone());
-        let mut live = LiveText::with_document(&document).expect("table cell path manifest initializes");
-        live.apply_full_state(&mut session, &initial).expect("table cell roots seed");
+        let (mut session, live) = seeded_client(&document, &initial);
         session.sel = Selection::caret(Pos::new(wordcraft_doc::StoryRef::Body, cell_path.clone(), 5));
 
         let selection = live.capture_selection(&session).expect("local selection captures from the cell path");
@@ -3068,9 +3065,7 @@ mod tests {
     fn table_structure_changes_are_rejected_before_shared_roots_change() {
         let document = table_body_document();
         let initial = seed_document_roots(&document);
-        let mut session = Session::new(document.clone());
-        let mut live = LiveText::with_document(&document).expect("fixed table manifest initializes");
-        live.apply_full_state(&mut session, &initial).expect("table roots seed");
+        let (mut session, mut live) = seeded_client(&document, &initial);
         let before = supported_body(&session.doc).expect("supported initial body");
         let shared_before = live.shared_paragraphs().expect("shared text reads");
         let original_document = session.doc.clone();
@@ -3091,9 +3086,7 @@ mod tests {
     fn table_structure_commands_roll_back_through_the_editor_wrapper() {
         let document = table_body_document();
         let initial = seed_document_roots(&document);
-        let mut session = Session::new(document.clone());
-        let mut live = LiveText::with_document(&document).expect("fixed table manifest initializes");
-        live.apply_full_state(&mut session, &initial).expect("table roots seed");
+        let (mut session, mut live) = seeded_client(&document, &initial);
         let cell_path = Path(vec![1, 0, 0, 0]);
         session.sel = Selection::caret(Pos::new(wordcraft_doc::StoryRef::Body, cell_path, 2));
         let original_document = session.doc.clone();

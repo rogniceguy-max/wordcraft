@@ -384,7 +384,6 @@ fn is_standard_base64_sticky(value: &str) -> bool {
 struct CollaborationRoom {
     id: String,
     epoch: u64,
-    paragraph_count: usize,
     roots: Vec<CollaborationRoot>,
     #[cfg(test)]
     seed_update: Vec<u8>,
@@ -405,7 +404,6 @@ struct StoredCollaborationUpdate {
 
 struct CollaborationData {
     epoch: u64,
-    paragraph_count: usize,
     roots: Vec<CollaborationRoot>,
     seed_update: Vec<u8>,
     updates: Vec<StoredCollaborationUpdate>,
@@ -1187,7 +1185,6 @@ impl Store {
         let document = wordcraft_engine::io::document_from_storage_snapshot(&snapshot).map_err(|error| StoreError::Corrupt(error.to_string()))?;
         let seed_content = collaboration_seed_content(&document)?;
         let roots = seed_content.roots.clone();
-        let paragraph_count = roots.len();
 
         let collaboration = transaction
             .query_row("SELECT epoch, seed_update FROM collaboration_documents WHERE document_id = ?1", [id], |row| {
@@ -1215,7 +1212,7 @@ impl Store {
             }
         }
         transaction.commit()?;
-        Ok(CollaborationData { epoch, paragraph_count, roots, seed_update, updates })
+        Ok(CollaborationData { epoch, roots, seed_update, updates })
     }
 
     fn append_collaboration_update(
@@ -1427,7 +1424,6 @@ impl CollaborationRoom {
         Ok(CollaborationRoom {
             id,
             epoch: data.epoch,
-            paragraph_count: data.paragraph_count,
             roots: data.roots,
             #[cfg(test)]
             seed_update: data.seed_update,
@@ -1465,7 +1461,7 @@ impl CollaborationRoom {
             // This can happen if another server process stored the same payload while this room
             // was running. Refresh from the durable log and avoid a duplicate broadcast.
             let data = store.load_or_seed_collaboration(&self.id)?;
-            if data.epoch != self.epoch || data.paragraph_count != self.paragraph_count || data.roots != self.roots {
+            if data.epoch != self.epoch || data.roots != self.roots {
                 return Err(StoreError::CollaborationEpoch);
             }
             let document = rebuild_collaboration_document(&data.seed_update, &data.updates, &data.roots, false)?;
@@ -2124,11 +2120,8 @@ mod tests {
         insertion: &str,
         attrs: Attrs,
     ) -> Vec<u8> {
-        let (doc, texts) = collaboration_client_with_paragraphs(seed, client_id, paragraph_count);
-        let text = texts.get(paragraph_index).expect("paragraph root exists");
-        let mut transaction = doc.transact_mut();
-        text.insert_with_attributes(&mut transaction, offset, insertion, attrs);
-        transaction.encode_update_v1()
+        let root_names: Vec<_> = (0..paragraph_count).map(super::collaboration_text_root).collect();
+        client_insert_in_root_names(seed, client_id, &root_names, paragraph_index, offset, insertion, attrs)
     }
 
     fn client_insert_at_root(seed: &[u8], client_id: u64, root_name: &str, insertion: &str) -> Vec<u8> {
@@ -2281,7 +2274,7 @@ mod tests {
             .expect("document creates");
         let rooms = super::CollaborationRooms::default();
         let room = rooms.get_or_load(&store, &created.summary.id).expect("multi-paragraph collaboration room seeds");
-        assert_eq!(room.paragraph_count, 2);
+        assert_eq!(room.roots.len(), 2);
         assert_eq!(room.roots.iter().map(|root| root.root_name.as_str()).collect::<Vec<_>>(), vec!["body:main", "body:paragraph:1"]);
 
         let (alice, alice_texts) = collaboration_client_with_paragraphs(&room.seed_update, 901, 2);
@@ -2331,7 +2324,7 @@ mod tests {
         let created =
             store.create("Collaborative table", wordcraft_engine::io::storage_snapshot(&seed_document).expect("snapshot")).expect("document creates");
         let room = super::CollaborationRooms::default().get_or_load(&store, &created.summary.id).expect("table collaboration room seeds");
-        assert_eq!(room.paragraph_count, 7);
+        assert_eq!(room.roots.len(), 7);
         let root_names: Vec<_> = room.roots.iter().map(|root| root.root_name.clone()).collect();
         assert_eq!(
             root_names,
@@ -2415,7 +2408,7 @@ mod tests {
         let reopened = Store::open(&path).expect("store reopens");
         let rooms = super::CollaborationRooms::default();
         let room = rooms.get_or_load(&reopened, &document_id).expect("table update log replays");
-        assert_eq!(room.paragraph_count, 7, "root manifest is recovered from the materialized snapshot");
+        assert_eq!(room.roots.len(), 7, "root manifest is recovered from the materialized snapshot");
         let root_names: Vec<_> = room.roots.iter().map(|root| root.root_name.clone()).collect();
         let (client, texts) = collaboration_client_with_roots(&room.seed_update, 954, &root_names);
         client
@@ -2510,7 +2503,7 @@ mod tests {
             .expect("document creates");
         let rooms = super::CollaborationRooms::default();
         let room = rooms.get_or_load(&store, &created.summary.id).expect("room seeds all paragraph roots");
-        assert_eq!(room.paragraph_count, 3);
+        assert_eq!(room.roots.len(), 3);
         let update = client_insert_in_paragraph(&room.seed_update, 905, 3, 1, 0, "middle", Attrs::new());
         assert!(room.accept_update(&store, &update).expect("empty paragraph root accepts text"));
 
@@ -2549,8 +2542,8 @@ mod tests {
         let reopened = Store::open(&path).expect("store reopens");
         let rooms = super::CollaborationRooms::default();
         let room = rooms.get_or_load(&reopened, &document_id).expect("multi-paragraph update log replays");
-        assert_eq!(room.paragraph_count, 2, "fixed paragraph count is recovered from the materialized snapshot");
-        let (client, texts) = collaboration_client_with_paragraphs(&room.seed_update, 913, room.paragraph_count);
+        assert_eq!(room.roots.len(), 2, "fixed paragraph count is recovered from the materialized snapshot");
+        let (client, texts) = collaboration_client_with_paragraphs(&room.seed_update, 913, room.roots.len());
         client
             .transact_mut()
             .apply_update(Update::decode_v1(&room.full_state().expect("replayed state encodes")).expect("replayed state decodes"))
